@@ -20,7 +20,7 @@ from parser_core import run_project, load_history
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 8146349890  # ← твій Telegram ID
+ADMIN_CHAT_ID = 512739407  # ← твій справжній особистий ID
 
 PROJECTS_FILE = "projects.json"
 MIN_KEYWORDS_FOR_ALERT = 2
