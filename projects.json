@@ -250,10 +250,8 @@
   "paris hors arjel",
   "meilleur site hors arjel"
 ],
-      "pages": 4,
       "history_file": "serp_history_FR2.json",
       "output_prefix": "serp_top30_FR",
-      "max_positions": 30
     },
     {
       "name": "NL Drops",
@@ -467,7 +465,7 @@
         "meilleur application paris sportif belgique",
         "paris sportif france belgique"
       ],
-      "max_positions": 30,
+
       "history_file": "serp_history_new.json",
       "output_prefix": "serp_top_40_NL"
     }
