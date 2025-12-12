@@ -20,17 +20,16 @@ from parser_core import run_project, load_history
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 8146349890  # твій ID
+ADMIN_CHAT_ID = 8146349890  # ← твій Telegram ID
 
 PROJECTS_FILE = "projects.json"
 MIN_KEYWORDS_FOR_ALERT = 2
 DROP_THRESHOLD = 0.5
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # =========================
-# ПРОЄКТИ + HELPERS + ANALYTICS (без змін)
+# ПРОЄКТИ
 # =========================
 def load_projects():
     with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
@@ -40,6 +39,9 @@ def load_projects():
 PROJECTS = load_projects()
 PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
 
+# =========================
+# HELPERS
+# =========================
 def resolve_output_path(raw) -> Optional[Path]:
     if isinstance(raw, (str, Path)):
         return Path(raw)
@@ -84,7 +86,7 @@ def analyze_changes():
     return drops, new_domains
 
 # =========================
-# КЛАВІАТУРИ + ХЕНДЛЕРИ (твої, без змін)
+# КЛАВІАТУРИ
 # =========================
 def get_state(context):
     ud = context.user_data
@@ -92,50 +94,121 @@ def get_state(context):
     ud.setdefault("pages", 3)
     return ud
 
-# ← встав тут свої kb_main, kb_projects, kb_pages, kb_delete, kb_confirm (як у тебе було)
+def kb_main(st):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Обрати проєкти", callback_data="projects")],
+        [InlineKeyboardButton(f"Сторінки ({st['pages']})", callback_data="pages")],
+        [InlineKeyboardButton("Запустити", callback_data="run")],
+        [InlineKeyboardButton("Видалити проєкт", callback_data="delete")],
+    ])
 
+def kb_projects(st):
+    rows = []
+    for n in PROJECTS_BY_NAME:
+        mark = "Вибрано" if n in st["projects"] else "Порожньо"
+        rows.append([InlineKeyboardButton(f"{mark} {n}", callback_data=f"p:{n}")])
+    rows.append([InlineKeyboardButton("Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_pages(st):
+    rows, row = [], []
+    for i in range(1, 11):
+        label = f"{'Вибрано' if i == st['pages'] else ''} {i}"
+        row.append(InlineKeyboardButton(label, callback_data=f"pg:{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+# =========================
+# ХЕНДЛЕРИ
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     await update.effective_chat.send_message("Головне меню:", reply_markup=kb_main(st))
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ← встав сюди свій повний callback (той що був раніше)
+    q = update.callback_query
+    await q.answer()
+    st = get_state(context)
+    d = q.data
+
+    if d == "projects":
+        await q.edit_message_text("Оберіть проєкти:", reply_markup=kb_projects(st))
+    elif d.startswith("p:"):
+        name = d[2:]
+        if name in st["projects"]:
+            st["projects"].remove(name)
+        else:
+            st["projects"].add(name)
+        await q.edit_message_reply_markup(reply_markup=kb_projects(st))
+    elif d == "pages":
+        await q.edit_message_text("Кількість сторінок:", reply_markup=kb_pages(st))
+    elif d.startswith("pg:"):
+        st["pages"] = int(d[3:])
+        await q.edit_message_reply_markup(reply_markup=kb_pages(st))
+    elif d == "run":
+        if not st["projects"]:
+            await q.edit_message_text("Спочатку оберіть проєкти!", reply_markup=kb_main(st))
+            return
+        await q.edit_message_text("Запускаю парсинг...")
+        asyncio.create_task(run_parsing(q.message.chat_id, context, st))
+    elif d == "back":
+        await q.edit_message_text("Головне меню:", reply_markup=kb_main(st))
 
 async def run_parsing(chat_id, context, st):
-    # ← встав сюди свій повний run_parsing (той що був раніше)
+    pages = st["pages"]
+    for name in st["projects"]:
+        cfg = dict(PROJECTS_BY_NAME[name])
+        cfg["max_positions"] = pages * 10
+        await context.bot.send_message(chat_id, f"Парсинг: {name}")
+        raw = await run_project(cfg)
+        path = resolve_output_path(raw)
+        if not path or not path.exists():
+            await context.bot.send_message(chat_id, f"Помилка: файл не створено ({name})")
+            continue
+        path = rename_excel(path, pages)
+        drops, new_domains = analyze_changes()
+        msg = f"{name} готовий (топ-{pages*10})"
+        if drops:
+            msg += "\nDROP: " + ", ".join([f"{d}({b}→{c})" for d, b, c in drops])
+        if new_domains:
+            msg += "\nNEW: " + ", ".join([f"{d}({c})" for d, c in new_domains])
+        await context.bot.send_message(chat_id, msg)
+        with path.open("rb") as f:
+            await context.bot.send_document(chat_id, document=f, filename=path.name)
+    await context.bot.send_message(chat_id, "Усе готово!")
 
 # =========================
-# АВТОПАРСИНГ КОЖНІ 3 ГОДИНИ
+# АВТОПАРСИНГ КОЖНІ 3 ГОДИНИ — УСІ ПРОЄКТИ, ТОП-30
 # =========================
-async def auto_parsing_task(app: Application):
-    while True:
+async def auto_parsing(context):
+    pages = 3
+    for name in PROJECTS_BY_NAME.keys():
         try:
-            print(f"[{datetime.now()}] Автопарсинг усіх проєктів (топ-30)...")
-            pages = 3
-            for name in PROJECTS_BY_NAME.keys():
-                cfg = dict(PROJECTS_BY_NAME[name])
-                cfg["max_positions"] = pages * 10
-                raw = await run_project(cfg)
-                path = resolve_output_path(raw)
-                if path and path.exists():
-                    path = rename_excel(path, pages)
-                    drops, new_domains = analyze_changes()
-                    msg = f"{name} (топ-30)"
-                    if drops:
-                        msg += "\nDROP: " + ", ".join([f"{d}({b}→{c})" for d, b, c in drops])
-                    if new_domains:
-                        msg += "\nNEW: " + ", ".join([f"{d}({c})" for d, c in new_domains])
-                    await app.bot.send_message(ADMIN_CHAT_ID, msg)
-                    with path.open("rb") as f:
-                        await app.bot.send_document(ADMIN_CHAT_ID, document=f, filename=path.name)
-            await app.bot.send_message(ADMIN_CHAT_ID, "Автопарсинг завершено. Наступний через 3 години.")
+            cfg = dict(PROJECTS_BY_NAME[name])
+            cfg["max_positions"] = 30
+            raw = await run_project(cfg)
+            path = resolve_output_path(raw)
+            if path and path.exists():
+                path = rename_excel(path, pages)
+                drops, new_domains = analyze_changes()
+                msg = f"{name} (авто топ-30)"
+                if drops:
+                    msg += "\nDROP: " + ", ".join([f"{d}({b}→{c})" for d, b, c in drops])
+                if new_domains:
+                    msg += "\nNEW: " + ", ".join([f"{d}({c})" for d, c in new_domains])
+                await context.bot.send_message(ADMIN_CHAT_ID, msg)
+                with path.open("rb") as f:
+                    await context.bot.send_document(ADMIN_CHAT_ID, document=f, filename=path.name)
         except Exception as e:
-            await app.bot.send_message(ADMIN_CHAT_ID, f"Помилка автопарсингу: {e}")
-            print("Помилка:", e)
-        await asyncio.sleep(3 * 60 * 60)
+            await context.bot.send_message(ADMIN_CHAT_ID, f"Помилка в {name}: {e}")
 
 # =========================
-# MAIN — ТЕПЕР БЕЗ asyncio.run!
+# MAIN — НАЙПРОСТІШИЙ І НАДІЙНИЙ СПОСІБ
 # =========================
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -143,15 +216,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
 
-    # Запускаємо автопарсинг у фоні через job_queue (найнадійніший спосіб)
-    app.job_queue.run_repeating(
-        callback=lambda context: asyncio.create_task(auto_parsing_task(app)),
-        interval=10800,  # 3 години
-        first=10         # перший запуск через 10 секунд
-    )
+    # Автопарсинг кожні 3 години (перший запуск — через 15 секунд)
+    app.job_queue.run_repeating(auto_parsing, interval=10800, first=15)
 
-    print("Бот запущений + автопарсинг кожні 3 години (усі проєкти, топ-30)")
-    app.run_polling()
+    print("Бот запущений. Автопарсинг усіх проєктів (топ-30) кожні 3 години")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
