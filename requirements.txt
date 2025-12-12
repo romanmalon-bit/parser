@@ -1,4 +1,6 @@
-python-telegram-bot==20.7
-requests
+python-telegram-bot[all]==21.5
 pandas
 openpyxl
+requests
+beautifulsoup4
+lxml
