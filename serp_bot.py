@@ -21,10 +21,10 @@ from telegram.ext import (
 from parser_core import run_project, load_history, save_history
 
 # =========================
-# НАЛАШТУВАННЯ
+# НАЛАШТУВАННЯ (ТВОЇ)
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 512739407  # Твій ID — сюди приходять алерти
+ADMIN_CHAT_ID = 512739407
 
 PROJECTS_FILE = "projects.json"
 
@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 # СТАН ДОДАВАННЯ ПРОЄКТУ
 # =========================
 (
-    NAME, LOCATION, LANGUAGE, API_KEYS, TARGET_DOMAINS, KEYWORDS, OUTPUT_PREFIX, HISTORY_FILE
+    NAME, LOCATION, LANGUAGE, API_KEYS,
+    TARGET_DOMAINS, KEYWORDS,
+    OUTPUT_PREFIX, HISTORY_FILE
 ) = range(8)
 
 # =========================
@@ -63,103 +65,18 @@ def reload_projects():
     PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
 
 # =========================
-# ЛОГУВАННЯ ПОМИЛОК
+# STATE (ТВОЯ ЛОГІКА)
 # =========================
-async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: str):
-    try:
-        await context.bot.send_message(
-            ADMIN_CHAT_ID,
-            f"🚨 ПОМИЛКА В БОТІ:\n{error_text}\nЧас: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception as e:
-        print("Не вдалося надіслати помилку адміну:", e)
-
-# =========================
-# ДОДАВАННЯ ПРОЄКТУ КРОК ЗА КРОКОМ
-# =========================
-async def start_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Почнемо додавання нового проєкту!\n\nКрок 1: Введіть назву проєкту (наприклад: FR Drops)")
-    context.user_data["new_project"] = {}
-    return NAME
-
-async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if name in PROJECTS_BY_NAME:
-        await update.message.reply_text(f"Проєкт з назвою «{name}» вже існує. Спробуйте іншу назву.")
-        return NAME
-    context.user_data["new_project"]["name"] = name
-    await update.message.reply_text(f"Назва: {name}\n\nКрок 2: Введіть країну (location, наприклад: France)")
-    return LOCATION
-
-async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_project"]["location"] = update.message.text.strip()
-    await update.message.reply_text(f"Країна: {update.message.text}\n\nКрок 3: Введіть код мови (hl та gl, наприклад: fr)")
-    return LANGUAGE
-
-async def get_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = update.message.text.strip()
-    context.user_data["new_project"]["hl"] = lang
-    context.user_data["new_project"]["gl"] = lang
-    await update.message.reply_text(f"Мова: {lang}\n\nКрок 4: Введіть API ключі (через кому, якщо кілька)")
-    return API_KEYS
-
-async def get_api_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys = [k.strip() for k in update.message.text.split(",") if k.strip()]
-    context.user_data["new_project"]["api_keys"] = keys
-    await update.message.reply_text(f"Ключів: {len(keys)}\n\nКрок 5: Введіть таргет-домени (по одному на рядок або через кому)")
-    return TARGET_DOMAINS
-
-async def get_target_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    domains = [d.strip() for d in update.message.text.replace(",", "\n").split("\n") if d.strip()]
-    context.user_data["new_project"]["target_domains"] = domains
-    await update.message.reply_text(f"Доменів: {len(domains)}\n\nКрок 6: Введіть ключові слова (по одному на рядок або через кому)")
-    return KEYWORDS
-
-async def get_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keywords = [k.strip() for k in update.message.text.replace(",", "\n").split("\n") if k.strip()]
-    context.user_data["new_project"]["keywords"] = keywords
-    await update.message.reply_text(f"Ключів: {len(keywords)}\n\nКрок 7: Введіть префікс вихідного файлу (наприклад: serp_top30_FR)")
-    return OUTPUT_PREFIX
-
-async def get_output_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_project"]["output_prefix"] = update.message.text.strip()
-    await update.message.reply_text(f"Префікс: {update.message.text}\n\nКрок 8: Введіть ім'я файлу історії (наприклад: serp_history_FR2.json)")
-    return HISTORY_FILE
-
-async def get_history_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    history_file = update.message.text.strip()
-    context.user_data["new_project"]["history_file"] = history_file
-
-    # Створюємо новий проєкт
-    new_project = context.user_data["new_project"]
-
-    # Додаємо в projects.json
-    PROJECTS.append(new_project)
-    save_projects(PROJECTS)
-    reload_projects()
-
-    # Створюємо порожній файл історії, якщо не існує
-    history_path = Path(history_file)
-    if not history_path.exists():
-        history_path.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
-
-    await update.message.reply_text(
-        f"Проєкт «{new_project['name']}» успішно додано!\n"
-        f"Тепер доступний для парсингу (ручного та автоматичного).\n"
-        "Повертаюсь у головне меню.",
-        reply_markup=kb_main(get_state(context))
-    )
-
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Додавання проєкту скасовано.", reply_markup=kb_main(get_state(context)))
-    context.user_data.clear()
-    return ConversationHandler.END
+def get_state(context: ContextTypes.DEFAULT_TYPE):
+    if "state" not in context.user_data:
+        context.user_data["state"] = {
+            "pages": 3,
+            "projects": [],
+        }
+    return context.user_data["state"]
 
 # =========================
-# КЛАВІАТУРИ (з кнопкою додавання)
+# КЛАВІАТУРА
 # =========================
 def kb_main(st):
     return InlineKeyboardMarkup([
@@ -171,22 +88,172 @@ def kb_main(st):
         [InlineKeyboardButton("ℹ️ Довідка", callback_data="info")],
     ])
 
-# ... (інші клавіатури kb_projects, kb_pages, kb_delete, kb_confirm — як у твоєму оригінальному коді)
+def kb_projects(st):
+    buttons = []
+    for p in PROJECTS:
+        name = p["name"]
+        mark = "✅" if name in st["projects"] else "☑️"
+        buttons.append([InlineKeyboardButton(f"{mark} {name}", callback_data=f"toggle:{name}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_pages():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1", callback_data="setpages:1"),
+            InlineKeyboardButton("2", callback_data="setpages:2"),
+            InlineKeyboardButton("3", callback_data="setpages:3"),
+        ],
+        [
+            InlineKeyboardButton("4", callback_data="setpages:4"),
+            InlineKeyboardButton("5", callback_data="setpages:5"),
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ])
+
+def kb_delete():
+    buttons = []
+    for p in PROJECTS:
+        buttons.append([InlineKeyboardButton(f"🗑 {p['name']}", callback_data=f"del:{p['name']}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
 
 # =========================
-# HANDLERS (start визначено перед додаванням)
+# /start
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     await update.effective_chat.send_message(
-        "Привіт! Це бот для парсингу SERP.\n"
-        "- Авто-парсинг усіх проєктів (топ-30) кожні 3 години.\n"
-        "- Ручний парсинг: виберіть проєкти/сторінки і запустіть.\n"
-        "Оберіть опцію в меню:",
+        "Привіт! Це бот для парсингу SERP.",
         reply_markup=kb_main(st)
     )
 
-# ... (інші хендлери callback, run_parsing, analyze_changes тощо — як у твоєму оригінальному коді)
+# =========================
+# ✅ CALLBACK — ГОЛОВНЕ ВИПРАВЛЕННЯ
+# =========================
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    st = get_state(context)
+    data = query.data
+
+    if data == "projects":
+        reload_projects()
+        await query.edit_message_text("Виберіть проєкти:", reply_markup=kb_projects(st))
+
+    elif data.startswith("toggle:"):
+        name = data.split(":", 1)[1]
+        if name in st["projects"]:
+            st["projects"].remove(name)
+        else:
+            st["projects"].append(name)
+        await query.edit_message_reply_markup(reply_markup=kb_projects(st))
+
+    elif data == "pages":
+        await query.edit_message_text("Оберіть кількість сторінок:", reply_markup=kb_pages())
+
+    elif data.startswith("setpages:"):
+        st["pages"] = int(data.split(":")[1])
+        await query.edit_message_text("Оновлено.", reply_markup=kb_main(st))
+
+    elif data == "run":
+        await query.edit_message_text("⏳ Запуск парсингу…")
+        for name in st["projects"]:
+            project = PROJECTS_BY_NAME.get(name)
+            if project:
+                await run_project(project, pages=st["pages"])
+        await query.edit_message_text("✅ Готово.", reply_markup=kb_main(st))
+
+    elif data == "add_project":
+        await query.edit_message_text("Запусти команду /addproject")
+
+    elif data == "delete":
+        await query.edit_message_text("Оберіть проєкт для видалення:", reply_markup=kb_delete())
+
+    elif data.startswith("del:"):
+        name = data.split(":", 1)[1]
+        projects = load_projects()
+        projects = [p for p in projects if p["name"] != name]
+        save_projects(projects)
+        reload_projects()
+        await query.edit_message_text(f"Проєкт «{name}» видалено.", reply_markup=kb_main(st))
+
+    elif data == "info":
+        await query.edit_message_text("ℹ️ /start /addproject /cancel", reply_markup=kb_main(st))
+
+    elif data == "back":
+        await query.edit_message_text("Меню:", reply_markup=kb_main(st))
+
+# =========================
+# Conversation: ДОДАВАННЯ ПРОЄКТУ
+# =========================
+async def start_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_project"] = {}
+    await update.message.reply_text("Крок 1: Назва проєкту")
+    return NAME
+
+async def get_name(update, context):
+    context.user_data["new_project"]["name"] = update.message.text
+    await update.message.reply_text("Крок 2: Країна")
+    return LOCATION
+
+async def get_location(update, context):
+    context.user_data["new_project"]["location"] = update.message.text
+    await update.message.reply_text("Крок 3: Мова (hl/gl)")
+    return LANGUAGE
+
+async def get_language(update, context):
+    lang = update.message.text
+    context.user_data["new_project"]["hl"] = lang
+    context.user_data["new_project"]["gl"] = lang
+    await update.message.reply_text("Крок 4: API ключі")
+    return API_KEYS
+
+async def get_api_keys(update, context):
+    context.user_data["new_project"]["api_keys"] = update.message.text.split(",")
+    await update.message.reply_text("Крок 5: Домени")
+    return TARGET_DOMAINS
+
+async def get_target_domains(update, context):
+    context.user_data["new_project"]["target_domains"] = update.message.text.split(",")
+    await update.message.reply_text("Крок 6: Ключові слова")
+    return KEYWORDS
+
+async def get_keywords(update, context):
+    context.user_data["new_project"]["keywords"] = update.message.text.split(",")
+    await update.message.reply_text("Крок 7: output_prefix")
+    return OUTPUT_PREFIX
+
+async def get_output_prefix(update, context):
+    context.user_data["new_project"]["output_prefix"] = update.message.text
+    await update.message.reply_text("Крок 8: history_file")
+    return HISTORY_FILE
+
+async def get_history_file(update, context):
+    project = context.user_data["new_project"]
+    project["history_file"] = update.message.text
+
+    projects = load_projects()
+    projects.append(project)
+    save_projects(projects)
+    reload_projects()
+
+    Path(project["history_file"]).touch(exist_ok=True)
+    await update.message.reply_text("✅ Проєкт додано.", reply_markup=kb_main(get_state(context)))
+    return ConversationHandler.END
+
+async def cancel_add_project(update, context):
+    await update.message.reply_text("❌ Скасовано.", reply_markup=kb_main(get_state(context)))
+    return ConversationHandler.END
+
+# =========================
+# AUTO PARSING
+# =========================
+async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
+    reload_projects()
+    for project in PROJECTS:
+        await run_project(project, pages=3)
 
 # =========================
 # MAIN
@@ -194,11 +261,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Додаємо хендлер для меню
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
 
-    # Покрокове додавання проєкту
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("addproject", start_add_project)],
         states={
@@ -215,10 +280,7 @@ def main():
     )
     app.add_handler(add_conv)
 
-    # Автопарсинг (топ-30, кожні 3 години)
     app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=15)
-
-    print("Бот запущений з покроковим додаванням проєктів та логуванням помилок.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
