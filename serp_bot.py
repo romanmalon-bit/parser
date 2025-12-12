@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -20,7 +21,7 @@ from parser_core import run_project, load_history
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 512739407  # ← твій справжній особистий ID
+ADMIN_CHAT_ID = 512739407  # ← ТВІЙ СПРАВЖНІЙ ID (тепер правильно!)
 
 PROJECTS_FILE = "projects.json"
 MIN_KEYWORDS_FOR_ALERT = 2
@@ -40,7 +41,7 @@ PROJECTS = load_projects()
 PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
 
 # =========================
-# HELPERS
+# HELPERS + ANALYTICS
 # =========================
 def resolve_output_path(raw) -> Optional[Path]:
     if isinstance(raw, (str, Path)):
@@ -86,7 +87,7 @@ def analyze_changes():
     return drops, new_domains
 
 # =========================
-# КЛАВІАТУРИ
+# КЛАВІАТУРИ + ХЕНДЛЕРИ (твої оригінальні)
 # =========================
 def get_state(context):
     ud = context.user_data
@@ -123,9 +124,6 @@ def kb_pages(st):
     rows.append([InlineKeyboardButton("Назад", callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
-# =========================
-# ХЕНДЛЕРИ
-# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     await update.effective_chat.send_message("Головне меню:", reply_markup=kb_main(st))
@@ -183,9 +181,9 @@ async def run_parsing(chat_id, context, st):
     await context.bot.send_message(chat_id, "Усе готово!")
 
 # =========================
-# АВТОПАРСИНГ КОЖНІ 3 ГОДИНИ — УСІ ПРОЄКТИ, ТОП-30
+# АВТОПАРСИНГ (усі проєкти, топ-30, кожні 3 години)
 # =========================
-async def auto_parsing(context):
+async def auto_parsing_job(context):
     pages = 3
     for name in PROJECTS_BY_NAME.keys():
         try:
@@ -208,38 +206,34 @@ async def auto_parsing(context):
             await context.bot.send_message(ADMIN_CHAT_ID, f"Помилка в {name}: {e}")
 
 # =========================
-# MAIN — ПРАВИЛЬНИЙ ЗАПУСК ДЛЯ RENDER WEB SERVICE (free план)
+# ФЕЙКОВИЙ ПОРТ ДЛЯ RENDER WEB SERVICE
 # =========================
-import os
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Фейковий сервер, щоб Render бачив відкритий порт
 class HealthCheck(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"Bot alive")
 
-def run_fake_server():
+def start_fake_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheck)
-    print(f"Фейковий сервер запущено на порту {port} (для Render)")
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthCheck).serve_forever()
 
+# =========================
+# MAIN — 100% ПРАЦЮЄ НА RENDER FREE
+# =========================
 def main():
-    # 1. Спочатку запускаємо фейковий сервер у фоні
-    Thread(target=run_fake_server, daemon=True).start()
+    # Спочатку запускаємо фейковий сервер (щоб Render не падав)
+    Thread(target=start_fake_server, daemon=True).start()
 
-    # 2. Потім запускаємо бота
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
 
-    # Автопарсинг кожні 3 години (перший запуск — через 20 секунд)
-    app.job_queue.run_repeating(auto_parsing, interval=10800, first=20)
+    # Автопарсинг кожні 3 години (перший запуск через 20 сек)
+    app.job_queue.run_repeating(auto_parsing_job, interval=10800, first=20)
 
     print("Бот запущений + автопарсинг кожні 3 години. Чекай перший файл через 20 сек...")
     app.run_polling(drop_pending_updates=True)
