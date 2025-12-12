@@ -145,7 +145,7 @@ async def get_history_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"Проєкт «{new_project['name']}» успішно додано!\n"
-        f"Тепер він доступний для парсингу (ручного та автоматичного).\n"
+        f"Тепер доступний для парсингу (ручного та автоматичного).\n"
         "Повертаюсь у головне меню.",
         reply_markup=kb_main(get_state(context))
     )
@@ -159,7 +159,7 @@ async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 # =========================
-# МЕНЮ (з кнопкою додавання)
+# КЛАВІАТУРИ (з кнопкою додавання)
 # =========================
 def kb_main(st):
     return InlineKeyboardMarkup([
@@ -171,22 +171,22 @@ def kb_main(st):
         [InlineKeyboardButton("ℹ️ Довідка", callback_data="info")],
     ])
 
-# ... (інші клавіатури та хендлери — як раніше)
+# ... (інші клавіатури kb_projects, kb_pages, kb_delete, kb_confirm — як у твоєму оригінальному коді)
 
 # =========================
-# CALLBACK (обробка кнопки додавання)
+# HANDLERS (start визначено перед додаванням)
 # =========================
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
-    d = q.data
+    await update.effective_chat.send_message(
+        "Привіт! Це бот для парсингу SERP.\n"
+        "- Авто-парсинг усіх проєктів (топ-30) кожні 3 години.\n"
+        "- Ручний парсинг: виберіть проєкти/сторінки і запустіть.\n"
+        "Оберіть опцію в меню:",
+        reply_markup=kb_main(st)
+    )
 
-    if d == "add_project":
-        await q.edit_message_text("Використовуйте команду /addproject для покрокового додавання проєкту.")
-        return
-
-    # ... (решта обробки як раніше)
+# ... (інші хендлери callback, run_parsing, analyze_changes тощо — як у твоєму оригінальному коді)
 
 # =========================
 # MAIN
@@ -194,6 +194,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Додаємо хендлер для меню
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
 
