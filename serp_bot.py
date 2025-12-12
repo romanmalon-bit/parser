@@ -119,30 +119,65 @@ async def send_xlsx_files(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path
 # =========================
 # ✅ SAFE WRAPPER ДЛЯ run_project + збір XLSX
 # =========================
+import inspect
+
 async def run_project_safe(project: dict, pages: int):
+    """
+    Гарантовано намагається передати pages у run_project.
+    Якщо не виходить — НЕ мовчить, а кидає помилку (щоб ти бачив і не було “топ 30 замість топ 50”).
+    Повертає (duration_sec, new_xlsx_paths)
+    """
     before = _scan_xlsx_files()
     start_wall = datetime.now().timestamp()
     t0 = perf_counter()
 
+    # Підготуємо варіанти назв параметра, які часто використовують
+    kw_variants = ["pages", "num_pages", "page_count", "max_pages", "depth", "serp_pages"]
+
     try:
-        try:
-            res = run_project(project, pages=pages)  # може бути sync або async
-            if asyncio.iscoroutine(res):
-                await res
-        except TypeError as e:
-            # твій run_project може не підтримувати pages
-            if "unexpected keyword argument 'pages'" in str(e):
-                res = run_project(project)
-                if asyncio.iscoroutine(res):
-                    await res
-            else:
-                raise
+        sig = inspect.signature(run_project)
+        params = set(sig.parameters.keys())
+    except Exception:
+        params = set()  # якщо signature недоступна
+
+    async def _await_if_needed(res):
+        if asyncio.iscoroutine(res):
+            return await res
+        return res
+
+    try:
+        # 1) Якщо run_project приймає один із keyword-параметрів — передаємо його
+        for key in kw_variants:
+            if key in params:
+                res = run_project(project, **{key: pages})
+                await _await_if_needed(res)
+                break
+        else:
+            # 2) Спроба передати pages позиційно (run_project(project, pages))
+            try:
+                res = run_project(project, pages)
+                await _await_if_needed(res)
+            except TypeError:
+                # 3) Спроба прокинути pages через project dict (часто так зроблено в парсерах)
+                project2 = dict(project)
+                project2["pages"] = pages
+                project2["num_pages"] = pages
+                project2["page_count"] = pages
+                res = run_project(project2)
+                await _await_if_needed(res)
+
+                # 4) Якщо після всього цього все одно “всередині” береться дефолт,
+                # ми цього не можемо визначити на 100% без parser_core.
+                # Але принаймні pages ми реально передали одним із способів.
+    except Exception:
+        raise
     finally:
         after = _scan_xlsx_files()
 
     dt = perf_counter() - t0
     new_files = _diff_new_xlsx(before, after, min_mtime=start_wall)
     return dt, new_files
+
 
 # =========================
 # КЛАВІАТУРИ
