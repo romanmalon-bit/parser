@@ -2,10 +2,10 @@ import asyncio
 import json
 import logging
 import os
-from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from time import perf_counter
+from typing import List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,7 +25,6 @@ from parser_core import run_project, load_history, save_history
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
 ADMIN_CHAT_ID = 512739407  # Твій ID — сюди приходять алерти
-
 PROJECTS_FILE = "projects.json"
 
 logging.basicConfig(level=logging.INFO)
@@ -67,10 +66,7 @@ def reload_projects():
 # =========================
 def get_state(context: ContextTypes.DEFAULT_TYPE):
     if "state" not in context.user_data:
-        context.user_data["state"] = {
-            "pages": 3,
-            "projects": [],
-        }
+        context.user_data["state"] = {"pages": 3, "projects": []}
     return context.user_data["state"]
 
 # =========================
@@ -86,27 +82,67 @@ async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: st
         logger.error("Не вдалося надіслати помилку адміну: %s", e)
 
 # =========================
-# ✅ SAFE WRAPPER ДЛЯ run_project
+# ДОПОМІЖНЕ: пошук Excel-файлів
+# =========================
+def _scan_xlsx_files() -> dict:
+    files = {}
+    base = Path(".")
+    for p in base.rglob("*.xlsx"):
+        try:
+            files[str(p.resolve())] = p.stat().st_mtime
+        except Exception:
+            pass
+    return files
+
+def _diff_new_xlsx(before: dict, after: dict, min_mtime: float) -> List[str]:
+    out = []
+    for path, mtime in after.items():
+        if mtime >= min_mtime and (path not in before or before[path] < mtime):
+            out.append(path)
+    out.sort(key=lambda x: after.get(x, 0), reverse=True)
+    return out
+
+async def send_xlsx_files(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: List[str], caption_prefix: str = ""):
+    if not paths:
+        return
+    for p in paths[:5]:
+        try:
+            file_path = Path(p)
+            if not file_path.exists():
+                continue
+            caption = f"{caption_prefix}{file_path.name}".strip()
+            with file_path.open("rb") as f:
+                await context.bot.send_document(chat_id=chat_id, document=f, caption=caption[:1024])
+        except Exception as e:
+            logger.error("Не вдалося надіслати файл %s: %s", p, e)
+
+# =========================
+# ✅ SAFE WRAPPER ДЛЯ run_project + збір XLSX
 # =========================
 async def run_project_safe(project: dict, pages: int):
-    """
-    Гарантовано не падає, якщо run_project не підтримує параметр pages.
-    1) пробуємо run_project(project, pages=pages)
-    2) якщо TypeError про pages -> викликаємо run_project(project)
-    3) підтримка sync/async реалізацій
-    """
+    before = _scan_xlsx_files()
+    start_wall = datetime.now().timestamp()
+    t0 = perf_counter()
+
     try:
-        res = run_project(project, pages=pages)  # може бути sync або async
-        if asyncio.iscoroutine(res):
-            return await res
-        return res
-    except TypeError as e:
-        if "unexpected keyword argument 'pages'" in str(e):
-            res = run_project(project)
+        try:
+            res = run_project(project, pages=pages)  # може бути sync або async
             if asyncio.iscoroutine(res):
-                return await res
-            return res
-        raise
+                await res
+        except TypeError as e:
+            # твій run_project може не підтримувати pages
+            if "unexpected keyword argument 'pages'" in str(e):
+                res = run_project(project)
+                if asyncio.iscoroutine(res):
+                    await res
+            else:
+                raise
+    finally:
+        after = _scan_xlsx_files()
+
+    dt = perf_counter() - t0
+    new_files = _diff_new_xlsx(before, after, min_mtime=start_wall)
+    return dt, new_files
 
 # =========================
 # КЛАВІАТУРИ
@@ -149,7 +185,6 @@ def kb_pages():
         [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
     ])
 
-
 def kb_delete():
     buttons = []
     for p in PROJECTS:
@@ -169,7 +204,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# ✅ CALLBACK (існує і не падає)
+# ✅ CALLBACK
 # =========================
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -177,53 +212,102 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = get_state(context)
     data = query.data
+    chat_id = query.message.chat_id
 
     if data == "projects":
         reload_projects()
         await query.edit_message_text("Виберіть проєкти:", reply_markup=kb_projects(st))
+        return
 
-    elif data.startswith("toggle:"):
+    if data.startswith("toggle:"):
         name = data.split(":", 1)[1]
         if name in st["projects"]:
             st["projects"].remove(name)
         else:
             st["projects"].append(name)
         await query.edit_message_reply_markup(reply_markup=kb_projects(st))
+        return
 
-    elif data == "pages":
+    if data == "pages":
         await query.edit_message_text("Оберіть кількість сторінок:", reply_markup=kb_pages())
+        return
 
-    elif data.startswith("setpages:"):
+    if data.startswith("setpages:"):
         st["pages"] = int(data.split(":")[1])
         await query.edit_message_text("Оновлено.", reply_markup=kb_main(st))
+        return
 
-    elif data == "run":
+    if data == "run":
         if not st["projects"]:
             await query.edit_message_text("Спочатку оберіть хоча б один проєкт.", reply_markup=kb_main(st))
             return
 
-        await query.edit_message_text("⏳ Запуск парсингу…")
-        for name in st["projects"]:
+        pages = st["pages"]
+        await query.edit_message_text(
+            f"⏳ Старт ручного парсингу\n"
+            f"Проєктів: {len(st['projects'])}\n"
+            f"Сторінок: {pages} (топ {pages*10})"
+        )
+
+        total_sent = 0
+
+        for i, name in enumerate(st["projects"], start=1):
             project = PROJECTS_BY_NAME.get(name)
             if not project:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено у projects.json"
+                )
                 continue
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»… (сторінок: {pages})"
+            )
+
             try:
-                await run_project_safe(project, pages=st["pages"])
+                dt, new_xlsx = await run_project_safe(project, pages=pages)
+
+                if new_xlsx:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}"
+                    )
+                    await send_xlsx_files(context, chat_id, new_xlsx, caption_prefix=f"{name} — ")
+                    total_sent += min(len(new_xlsx), 5)
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"✅ «{name}» готово за {dt:.1f} сек.\n"
+                            f"⚠️ Excel (*.xlsx) не знайдено після парсингу.\n"
+                            f"Я шукав файли рекурсивно в корені проекту."
+                        )
+                    )
+
             except Exception as e:
                 err = f"Run project failed ({name}): {e}"
                 logger.exception(err)
                 await send_error_to_admin(context, err)
+                await context.bot.send_message(chat_id=chat_id, text=f"🚨 Помилка в «{name}»: {e}")
 
-        await query.edit_message_text("✅ Готово.", reply_markup=kb_main(st))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🏁 Ручний парсинг завершено. Надіслано файлів: {total_sent}"
+        )
+        await context.bot.send_message(chat_id=chat_id, text="Меню:", reply_markup=kb_main(st))
+        return
 
-    elif data == "add_project":
+    if data == "add_project":
         await query.edit_message_text("Запусти команду /addproject")
+        return
 
-    elif data == "delete":
+    if data == "delete":
         reload_projects()
         await query.edit_message_text("Оберіть проєкт для видалення:", reply_markup=kb_delete())
+        return
 
-    elif data.startswith("del:"):
+    if data.startswith("del:"):
         name = data.split(":", 1)[1]
         projects = load_projects()
         projects = [p for p in projects if p["name"] != name]
@@ -234,15 +318,17 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["projects"].remove(name)
 
         await query.edit_message_text(f"Проєкт «{name}» видалено.", reply_markup=kb_main(st))
+        return
 
-    elif data == "info":
+    if data == "info":
         await query.edit_message_text("ℹ️ /start /addproject /cancel", reply_markup=kb_main(st))
+        return
 
-    elif data == "back":
+    if data == "back":
         await query.edit_message_text("Меню:", reply_markup=kb_main(st))
+        return
 
-    else:
-        await query.edit_message_text(f"Невідома дія: {data}", reply_markup=kb_main(st))
+    await query.edit_message_text(f"Невідома дія: {data}", reply_markup=kb_main(st))
 
 # =========================
 # Conversation: ДОДАВАННЯ ПРОЄКТУ
@@ -331,20 +417,43 @@ async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
     try:
         reload_projects()
-        for project in PROJECTS:
+        if not PROJECTS:
+            return
+
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (топ 30)"
+        )
+
+        for i, project in enumerate(PROJECTS, start=1):
+            name = project.get("name", "Unnamed")
             try:
-                await run_project_safe(project, pages=3)
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»…")
+                dt, new_xlsx = await run_project_safe(project, pages=3)
+
+                if new_xlsx:
+                    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}")
+                    await send_xlsx_files(context, ADMIN_CHAT_ID, new_xlsx, caption_prefix=f"AUTO {name} — ")
+                else:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"✅ «{name}» готово за {dt:.1f} сек, але Excel (*.xlsx) не знайдено."
+                    )
+
             except Exception as e:
-                err = f"Auto parsing failed ({project.get('name','Unnamed')}): {e}"
+                err = f"Auto parsing failed ({name}): {e}"
                 logger.exception(err)
                 await send_error_to_admin(context, err)
+
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🏁 Автопарсинг завершено.")
+
     except Exception as e:
         err = f"auto_parsing_task crashed: {e}"
         logger.exception(err)
         await send_error_to_admin(context, err)
 
 # =========================
-# ERROR HANDLER (щоб не було "No error handlers...")
+# ERROR HANDLER
 # =========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception:", exc_info=context.error)
