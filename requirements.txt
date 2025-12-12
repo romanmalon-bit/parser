@@ -4,3 +4,5 @@ openpyxl
 requests
 beautifulsoup4
 lxml
+aiohttp==3.10.5
+aiohttp-retry==2.8.3
