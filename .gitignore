@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+*.xlsx
+*.zip
+serp_history*.json
+serp_test*.xlsx
+config.json
