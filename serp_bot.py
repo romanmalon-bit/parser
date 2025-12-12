@@ -208,28 +208,41 @@ async def auto_parsing(context):
             await context.bot.send_message(ADMIN_CHAT_ID, f"Помилка в {name}: {e}")
 
 # =========================
-# MAIN — НАЙПРОСТІШИЙ І НАДІЙНИЙ СПОСІБ
+# MAIN — ПРАВИЛЬНИЙ ЗАПУСК ДЛЯ RENDER WEB SERVICE (free план)
 # =========================
+import os
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Фейковий сервер, щоб Render бачив відкритий порт
+class HealthCheck(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_fake_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheck)
+    print(f"Фейковий сервер запущено на порту {port} (для Render)")
+    server.serve_forever()
+
 def main():
+    # 1. Спочатку запускаємо фейковий сервер у фоні
+    Thread(target=run_fake_server, daemon=True).start()
+
+    # 2. Потім запускаємо бота
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
 
-    # Автопарсинг кожні 3 години (перший запуск — через 15 секунд)
-    app.job_queue.run_repeating(auto_parsing, interval=10800, first=15)
+    # Автопарсинг кожні 3 години (перший запуск — через 20 секунд)
+    app.job_queue.run_repeating(auto_parsing, interval=10800, first=20)
 
-    print("Бот запущений. Автопарсинг усіх проєктів (топ-30) кожні 3 години")
+    print("Бот запущений + автопарсинг кожні 3 години. Чекай перший файл через 20 сек...")
     app.run_polling(drop_pending_updates=True)
-# Для Render Web Service — просто "обдурюємо" його, що порт відкритий
-import os
-from threading import Thread
 
-def fake_web():
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), 
-               lambda *args: None).serve_forever()
-
-Thread(target=fake_web, daemon=True).start()
 if __name__ == "__main__":
     main()
