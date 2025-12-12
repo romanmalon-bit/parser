@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 from time import perf_counter
-from typing import List
+from typing import List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -24,7 +24,8 @@ from parser_core import run_project
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 512739407
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # можна задавати в Render ENV
+ADMIN_FILE = "admin_chat_id.txt"
 PROJECTS_FILE = "projects.json"
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,40 @@ logger = logging.getLogger(__name__)
 (
     NAME, LOCATION, LANGUAGE, API_KEYS, TARGET_DOMAINS, KEYWORDS, OUTPUT_PREFIX, HISTORY_FILE
 ) = range(8)
+
+# =========================
+# ADMIN CHAT ID (стійко)
+# =========================
+def load_admin_chat_id() -> int:
+    if ADMIN_CHAT_ID:
+        return ADMIN_CHAT_ID
+    try:
+        if os.path.exists(ADMIN_FILE):
+            return int(Path(ADMIN_FILE).read_text(encoding="utf-8").strip())
+    except Exception:
+        pass
+    return 0
+
+def save_admin_chat_id(chat_id: int):
+    Path(ADMIN_FILE).write_text(str(chat_id), encoding="utf-8")
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    save_admin_chat_id(chat_id)
+    await update.message.reply_text(f"✅ ADMIN_CHAT_ID встановлено: {chat_id}")
+
+async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: str):
+    admin_id = load_admin_chat_id()
+    if not admin_id:
+        logger.error("ADMIN_CHAT_ID не заданий. Додай ENV ADMIN_CHAT_ID або виконай /admin")
+        return
+    try:
+        await context.bot.send_message(
+            admin_id,
+            f"🚨 ПОМИЛКА В БОТІ:\n{error_text}\nЧас: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except Exception as e:
+        logger.error("Не вдалося надіслати помилку адміну: %s", e)
 
 # =========================
 # ПРОЄКТИ
@@ -68,18 +103,6 @@ def get_state(context: ContextTypes.DEFAULT_TYPE):
     if "state" not in context.user_data:
         context.user_data["state"] = {"pages": 3, "projects": []}
     return context.user_data["state"]
-
-# =========================
-# ЛОГУВАННЯ ПОМИЛОК
-# =========================
-async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: str):
-    try:
-        await context.bot.send_message(
-            ADMIN_CHAT_ID,
-            f"🚨 ПОМИЛКА В БОТІ:\n{error_text}\nЧас: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception as e:
-        logger.error("Не вдалося надіслати помилку адміну: %s", e)
 
 # =========================
 # XLSX SCAN/SEND
@@ -117,20 +140,49 @@ async def send_xlsx_files(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path
             logger.error("Не вдалося надіслати файл %s: %s", p, e)
 
 # =========================
-# ✅ RUN PROJECT SAFE (передає pages у project_config)
+# ✅ GLOBAL PARSING CONTROL (task + cancel_event)
 # =========================
-async def run_project_safe(project: dict, pages: int):
+def _task_key(chat_id: int) -> str:
+    return f"parsing_task:{chat_id}"
+
+def _cancel_key(chat_id: int) -> str:
+    return f"parsing_cancel:{chat_id}"
+
+def get_parsing_task(app: Application, chat_id: int) -> Optional[asyncio.Task]:
+    return app.bot_data.get(_task_key(chat_id))
+
+def set_parsing_task(app: Application, chat_id: int, task: Optional[asyncio.Task]):
+    key = _task_key(chat_id)
+    if task is None:
+        app.bot_data.pop(key, None)
+    else:
+        app.bot_data[key] = task
+
+def get_cancel_event(app: Application, chat_id: int) -> asyncio.Event:
+    key = _cancel_key(chat_id)
+    ev = app.bot_data.get(key)
+    if ev is None:
+        ev = asyncio.Event()
+        app.bot_data[key] = ev
+    return ev
+
+def clear_cancel_event(app: Application, chat_id: int):
+    ev = get_cancel_event(app, chat_id)
+    ev.clear()
+
+# =========================
+# ✅ RUN PROJECT SAFE (передає pages + cancel_event у parser_core)
+# =========================
+async def run_project_safe(project: dict, pages: int, cancel_event: asyncio.Event):
     before = _scan_xlsx_files()
     start_wall = datetime.now().timestamp()
     t0 = perf_counter()
 
-    # ✅ Гарантовано передаємо pages у parser_core
     project_cfg = dict(project)
     project_cfg["pages"] = pages
 
-    res = run_project(project_cfg)
-    if asyncio.iscoroutine(res):
-        await res
+    # parser_core.run_project — async
+    await run_project(project_cfg, progress_callback=None, cancel_event=cancel_event)
 
     after = _scan_xlsx_files()
     dt = perf_counter() - t0
@@ -140,15 +192,18 @@ async def run_project_safe(project: dict, pages: int):
 # =========================
 # КЛАВІАТУРИ
 # =========================
-def kb_main(st):
-    return InlineKeyboardMarkup([
+def kb_main(st, can_stop: bool = False):
+    rows = [
         [InlineKeyboardButton("🧩 Виберіть проєкти", callback_data="projects")],
         [InlineKeyboardButton(f"📄 Сторінки: {st['pages']} (топ {st['pages']*10})", callback_data="pages")],
         [InlineKeyboardButton("▶️ Запустити парсинг", callback_data="run")],
         [InlineKeyboardButton("➕ Додати новий проєкт", callback_data="add_project")],
         [InlineKeyboardButton("🗑 Видалити проєкт", callback_data="delete")],
         [InlineKeyboardButton("ℹ️ Довідка", callback_data="info")],
-    ])
+    ]
+    if can_stop:
+        rows.insert(3, [InlineKeyboardButton("⛔ Зупинити парсинг", callback_data="stop")])
+    return InlineKeyboardMarkup(rows)
 
 def kb_projects(st):
     buttons = []
@@ -190,9 +245,10 @@ def kb_delete():
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
+    task = get_parsing_task(context.application, update.effective_chat.id)
     await update.effective_chat.send_message(
         "Привіт! Це бот для парсингу SERP.\nОберіть опцію в меню:",
-        reply_markup=kb_main(st)
+        reply_markup=kb_main(st, can_stop=task is not None and not task.done())
     )
 
 # =========================
@@ -205,6 +261,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     data = query.data
     chat_id = query.message.chat_id
+
+    # ---- STOP ----
+    if data == "stop":
+        task = get_parsing_task(context.application, chat_id)
+        if task is None or task.done():
+            await query.edit_message_text("ℹ️ Немає активного парсингу.", reply_markup=kb_main(st))
+            return
+
+        cancel_event = get_cancel_event(context.application, chat_id)
+        cancel_event.set()
+        task.cancel()
+
+        await query.edit_message_text("⛔ Запит на зупинку надіслано. Зараз зупиняю…", reply_markup=kb_main(st))
+        return
 
     if data == "projects":
         reload_projects()
@@ -230,52 +300,79 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "run":
+        # не даємо запускати 2 рази
+        running = get_parsing_task(context.application, chat_id)
+        if running is not None and not running.done():
+            await query.edit_message_text("⚠️ Парсинг вже запущений. Натисни ⛔ Зупинити парсинг, якщо треба.", reply_markup=kb_main(st, can_stop=True))
+            return
+
         if not st["projects"]:
             await query.edit_message_text("Спочатку оберіть хоча б один проєкт.", reply_markup=kb_main(st))
             return
 
         pages = st["pages"]
+        clear_cancel_event(context.application, chat_id)
+        cancel_event = get_cancel_event(context.application, chat_id)
+
         await query.edit_message_text(
             f"⏳ Старт ручного парсингу\n"
             f"Проєктів: {len(st['projects'])}\n"
-            f"Сторінок: {pages} (топ {pages*10})"
+            f"Сторінок: {pages} (топ {pages*10})\n\n"
+            f"⛔ Якщо треба — натисни кнопку STOP у меню.",
+            reply_markup=kb_main(st, can_stop=True),
         )
 
-        total_sent = 0
-
-        for i, name in enumerate(st["projects"], start=1):
-            project = PROJECTS_BY_NAME.get(name)
-            if not project:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено у projects.json")
-                continue
-
-            await context.bot.send_message(chat_id=chat_id, text=f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»… (сторінок: {pages})")
-
+        async def runner():
+            total_sent = 0
             try:
-                dt, new_xlsx = await run_project_safe(project, pages=pages)
+                for i, name in enumerate(st["projects"], start=1):
+                    if cancel_event.is_set():
+                        await context.bot.send_message(chat_id=chat_id, text="⛔ Парсинг зупинено користувачем.")
+                        return
 
-                if new_xlsx:
-                    await context.bot.send_message(chat_id=chat_id, text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}")
-                    await send_xlsx_files(context, chat_id, new_xlsx, caption_prefix=f"{name} — ")
-                    total_sent += min(len(new_xlsx), 5)
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"✅ «{name}» готово за {dt:.1f} сек.\n"
-                            f"⚠️ Excel (*.xlsx) не знайдено після парсингу.\n"
-                            f"Я шукав файли рекурсивно в корені проекту."
-                        )
-                    )
+                    project = PROJECTS_BY_NAME.get(name)
+                    if not project:
+                        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено у projects.json")
+                        continue
 
-            except Exception as e:
-                err = f"Run project failed ({name}): {e}"
-                logger.exception(err)
-                await send_error_to_admin(context, err)
-                await context.bot.send_message(chat_id=chat_id, text=f"🚨 Помилка в «{name}»: {e}")
+                    await context.bot.send_message(chat_id=chat_id, text=f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»… (сторінок: {pages})")
 
-        await context.bot.send_message(chat_id=chat_id, text=f"🏁 Ручний парсинг завершено. Надіслано файлів: {total_sent}")
-        await context.bot.send_message(chat_id=chat_id, text="Меню:", reply_markup=kb_main(st))
+                    try:
+                        dt, new_xlsx = await run_project_safe(project, pages=pages, cancel_event=cancel_event)
+
+                        if cancel_event.is_set():
+                            await context.bot.send_message(chat_id=chat_id, text="⛔ Парсинг зупинено користувачем.")
+                            return
+
+                        if new_xlsx:
+                            await context.bot.send_message(chat_id=chat_id, text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}")
+                            await send_xlsx_files(context, chat_id, new_xlsx, caption_prefix=f"{name} — ")
+                            total_sent += min(len(new_xlsx), 5)
+                        else:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"✅ «{name}» готово за {dt:.1f} сек.\n"
+                                    f"⚠️ Excel (*.xlsx) не знайдено після парсингу."
+                                )
+                            )
+
+                    except asyncio.CancelledError:
+                        await context.bot.send_message(chat_id=chat_id, text="⛔ Парсинг скасовано (task cancelled).")
+                        return
+                    except Exception as e:
+                        err = f"Run project failed ({name}): {e}"
+                        logger.exception(err)
+                        await send_error_to_admin(context, err)
+                        await context.bot.send_message(chat_id=chat_id, text=f"🚨 Помилка в «{name}»: {e}")
+
+                await context.bot.send_message(chat_id=chat_id, text=f"🏁 Ручний парсинг завершено. Надіслано файлів: {total_sent}")
+
+            finally:
+                set_parsing_task(context.application, chat_id, None)
+
+        task = context.application.create_task(runner())
+        set_parsing_task(context.application, chat_id, task)
         return
 
     if data == "add_project":
@@ -301,11 +398,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "info":
-        await query.edit_message_text("ℹ️ /start /addproject /cancel", reply_markup=kb_main(st))
+        await query.edit_message_text("ℹ️ /start /addproject /cancel /admin", reply_markup=kb_main(st))
         return
 
     if data == "back":
-        await query.edit_message_text("Меню:", reply_markup=kb_main(st))
+        task = get_parsing_task(context.application, chat_id)
+        await query.edit_message_text("Меню:", reply_markup=kb_main(st, can_stop=task is not None and not task.done()))
         return
 
     await query.edit_message_text(f"Невідома дія: {data}", reply_markup=kb_main(st))
@@ -395,31 +493,32 @@ async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # AUTO PARSING (топ-30 кожні 3 години)
 # =========================
 async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
+    admin_id = load_admin_chat_id()
+    if not admin_id:
+        return
+
     try:
         reload_projects()
         if not PROJECTS:
             return
 
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (топ 30 / pages=3)")
+        await context.bot.send_message(chat_id=admin_id, text=f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (pages=3 / топ 30)")
+
+        # окрема cancel подія для авто
+        cancel_event = asyncio.Event()
 
         for i, project in enumerate(PROJECTS, start=1):
             name = project.get("name", "Unnamed")
-            try:
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»…")
-                dt, new_xlsx = await run_project_safe(project, pages=3)
+            await context.bot.send_message(chat_id=admin_id, text=f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»…")
+            dt, new_xlsx = await run_project_safe(project, pages=3, cancel_event=cancel_event)
 
-                if new_xlsx:
-                    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}")
-                    await send_xlsx_files(context, ADMIN_CHAT_ID, new_xlsx, caption_prefix=f"AUTO {name} — ")
-                else:
-                    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ «{name}» готово за {dt:.1f} сек, але Excel (*.xlsx) не знайдено.")
+            if new_xlsx:
+                await context.bot.send_message(chat_id=admin_id, text=f"✅ «{name}» готово за {dt:.1f} сек. Excel: {len(new_xlsx)}")
+                await send_xlsx_files(context, admin_id, new_xlsx, caption_prefix=f"AUTO {name} — ")
+            else:
+                await context.bot.send_message(chat_id=admin_id, text=f"✅ «{name}» готово за {dt:.1f} сек, але Excel (*.xlsx) не знайдено.")
 
-            except Exception as e:
-                err = f"Auto parsing failed ({name}): {e}"
-                logger.exception(err)
-                await send_error_to_admin(context, err)
-
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🏁 Автопарсинг завершено.")
+        await context.bot.send_message(chat_id=admin_id, text="🏁 Автопарсинг завершено.")
 
     except Exception as e:
         err = f"auto_parsing_task crashed: {e}"
@@ -443,6 +542,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(callback))
 
     add_conv = ConversationHandler(
