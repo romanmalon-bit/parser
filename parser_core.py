@@ -232,9 +232,7 @@ async def serper_search_async(
                             continue
 
                     if r.status >= 500:
-                        print(
-                            f"\nСерверна помилка {r.status} — повтор через {backoff}с"
-                        )
+                        print(f"\nСерверна помилка {r.status} — повтор через {backoff}с")
                         await asyncio.sleep(backoff)
                         backoff = min(max_backoff, backoff * 2)
                         retry_count += 1
@@ -437,18 +435,18 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     """
     project_config:
       {
-        "name": "FR Casino",
-        "location": "France",
-        "gl": "fr",
-        "hl": "fr",
+        "name": "...",
+        "location": "...",
+        "gl": "...",
+        "hl": "...",
         "api_keys": [...],
         "target_domains": [...],
         "keywords": [...],
-        "max_positions": 30,
-        "history_file": "serp_history_fr.json",
-        "output_prefix": "serp_top30_serper_FR"
+        "pages": 5,                 <-- ✅ тепер підтримується
+        "max_positions": 30,        <-- або як раніше
+        "history_file": "...json",
+        "output_prefix": "..."
       }
-    progress_callback(done_keywords, total_keywords, found_positions) -> None
     """
     global LOCATION, GL, HL, TARGET_DOMAINS, PAGES, MAX_POSITIONS, HISTORY_FILE, OUTPUT_FILE
 
@@ -456,10 +454,21 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     GL = project_config["gl"]
     HL = project_config["hl"]
     TARGET_DOMAINS = set(project_config["target_domains"])
-    MAX_POSITIONS = int(project_config.get("max_positions", 30))
 
-    # автокалькуляція кількості сторінок під потрібний Top N
-    PAGES = max(1, math.ceil(MAX_POSITIONS / RESULTS_PER_PAGE))
+    # ✅ ГОЛОВНИЙ ФІКС: pages має пріоритет над max_positions
+    pages_cfg = project_config.get("pages")
+    maxpos_cfg = project_config.get("max_positions")
+
+    if pages_cfg is not None:
+        try:
+            PAGES = max(1, int(pages_cfg))
+        except Exception:
+            PAGES = 3
+        MAX_POSITIONS = PAGES * RESULTS_PER_PAGE
+    else:
+        MAX_POSITIONS = int(maxpos_cfg or 30)
+        PAGES = max(1, math.ceil(MAX_POSITIONS / RESULTS_PER_PAGE))
+
     HISTORY_FILE = project_config["history_file"]
 
     # Будуємо динамічні бакети під MAX_POSITIONS
@@ -487,10 +496,7 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     print("-" * 90)
 
     all_rows = []
-    # dict: domain -> {bucket_label: count}
-    domain_interval_counts = defaultdict(
-        lambda: {label: 0 for label in BUCKET_LABELS}
-    )
+    domain_interval_counts = defaultdict(lambda: {label: 0 for label in BUCKET_LABELS})
     domain_keywords = defaultdict(list)
 
     api_key_manager = APIKeyManager(project_config["api_keys"])
@@ -500,18 +506,14 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         total_kw = len(keywords)
         for i, kw in enumerate(keywords, 1):
-            keyword_data = await process_keyword(
-                kw, session, semaphore, api_key_manager
-            )
+            keyword_data = await process_keyword(kw, session, semaphore, api_key_manager)
             all_rows.extend(keyword_data)
 
             for item in keyword_data:
                 d = item["Domain"]
                 b = item["Bucket"]
                 domain_interval_counts[d][b] += 1
-                domain_keywords[d].append(
-                    {"keyword": item["Keyword"], "position": item["Position"]}
-                )
+                domain_keywords[d].append({"keyword": item["Keyword"], "position": item["Position"]})
 
             if progress_callback is not None:
                 progress_callback(i, total_kw, len(all_rows))
@@ -528,20 +530,6 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     history = load_history()
     save_history(all_rows, timestamp)
     target_rows = [r for r in all_rows if r["Is_Target"]]
-
-    print("\n" + "=" * 80)
-    print("ФІНАЛЬНА СТАТИСТИКА")
-    print("=" * 80)
-    print(f"Всього позицій: {len(all_rows)}")
-    print(
-        f"Збігів з таргетами (включаючи субдомени): {len(target_rows)}"
-    )
-    if target_rows:
-        print("По бакетах:")
-        for label in BUCKET_LABELS:
-            c = sum(1 for r in target_rows if r["Bucket"] == label)
-            if c:
-                print(f"  • {label}: {c}")
 
     # =========================
     # Excel
@@ -577,11 +565,9 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
         )
         if row["Is_Target"]:
             for c in range(1, 9):
-                ws_res.cell(row=ws_res.max_row, column=c).fill = PatternFill(
-                    "solid", "C6EFCE"
-                )
+                ws_res.cell(row=ws_res.max_row, column=c).fill = PatternFill("solid", "C6EFCE")
 
-    # 2. Target Domains Stats (динамічні бакети)
+    # 2. Target Domains Stats
     ws_target = wb.create_sheet("Target Domains Stats")
     headers_target = ["Domain", "Total"] + BUCKET_LABELS + ["Score", "Keywords"]
     style_header(ws_target, headers_target)
@@ -590,28 +576,20 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     for domain in set(r["Domain"] for r in target_rows):
         stats = domain_interval_counts[domain]
         total = sum(stats.values())
-        kw_list = "; ".join(
-            sorted(set(item["keyword"] for item in domain_keywords[domain]))
-        )
+        kw_list = "; ".join(sorted(set(item["keyword"] for item in domain_keywords[domain])))
         score = calculate_success_score(stats)
-
-        row = [domain, total] + [stats[label] for label in BUCKET_LABELS] + [
-            score,
-            kw_list,
-        ]
+        row = [domain, total] + [stats[label] for label in BUCKET_LABELS] + [score, kw_list]
         target_data.append(row)
 
-    score_index = 2 + len(BUCKET_LABELS)  # Domain, Total, <бакети>, Score, Keywords
+    score_index = 2 + len(BUCKET_LABELS)
     target_data.sort(key=lambda x: x[score_index], reverse=True)
 
     for row in target_data:
         ws_target.append(row)
         for c in range(1, len(headers_target) + 1):
-            ws_target.cell(row=ws_target.max_row, column=c).fill = PatternFill(
-                "solid", "C6EFCE"
-            )
+            ws_target.cell(row=ws_target.max_row, column=c).fill = PatternFill("solid", "C6EFCE")
 
-    # 3. Position Buckets (усі домени)
+    # 3. Position Buckets
     ws_pos = wb.create_sheet("Position Buckets")
     headers_pos = ["Domain", "Total"] + BUCKET_LABELS + ["Score"]
     style_header(ws_pos, headers_pos)
@@ -622,12 +600,7 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
         if total == 0:
             continue
         score = calculate_success_score(stats)
-        row_tuple = (
-            domain,
-            total,
-            *[stats[label] for label in BUCKET_LABELS],
-            score,
-        )
+        row_tuple = (domain, total, *[stats[label] for label in BUCKET_LABELS], score)
         all_domains_rows.append(row_tuple)
 
     all_domains_rows.sort(key=lambda x: x[2 + len(BUCKET_LABELS)], reverse=True)
@@ -635,11 +608,9 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
         ws_pos.append(row)
         if is_target_domain(row[0]):
             for c in range(1, len(headers_pos) + 1):
-                ws_pos.cell(row=ws_pos.max_row, column=c).fill = PatternFill(
-                    "solid", "C6EFCE"
-                )
+                ws_pos.cell(row=ws_pos.max_row, column=c).fill = PatternFill("solid", "C6EFCE")
 
-    # 4. Dynamics (All Keywords) з обмеженням LOST на 2 парсинги
+    # 4. Dynamics (All Keywords)
     ws_dyn = wb.create_sheet("Dynamics (All Keywords)")
     prev = len(history)
     headers_dyn = [
@@ -657,9 +628,7 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
     ]
     style_header(ws_dyn, headers_dyn)
 
-    # Унікальні (домен, ключ) з історії та поточного парсингу
     all_domain_keyword_pairs = set()
-
     for entry in history:
         for item in entry.get("results", []):
             if item.get("Is_Target"):
@@ -688,24 +657,17 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
             current_url = current_pairs[(domain, keyword)]["URL"]
             current_title = current_pairs[(domain, keyword)]["Title"]
         elif has_historical_position:
-            last_idx = max(
-                i for i, p in enumerate(hist) if p["position"] is not None
-            )
+            last_idx = max(i for i, p in enumerate(hist) if p["position"] is not None)
             runs_since_seen = prev - last_idx
 
             if runs_since_seen <= 2:
                 is_lost = True
                 current_pos = "LOST"
             else:
-                # більше 2 запусків без позиції — не показуємо
                 continue
-        else:
-            current_pos = None
 
         trend = calculate_trend(hist)
-        positions = [
-            p["position"] if p["position"] is not None else "—" for p in hist
-        ]
+        positions = [p["position"] if p["position"] is not None else "—" for p in hist]
         avg = get_average_position(hist)
         best = get_best_position(hist)
         worst = get_worst_position(hist)
@@ -749,7 +711,7 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
         if "Down" in str(cell_trend.value):
             cell_trend.font = Font(color="FF0000", bold=True)
 
-    # 5. Lost Keywords (тільки 2 парсинги після випадіння)
+    # 5. Lost Keywords
     ws_lost = wb.create_sheet("Lost Keywords")
     headers_lost = [
         "Domain",
@@ -787,60 +749,35 @@ async def run_project(project_config: dict, progress_callback=None) -> str:
             days_lost = "—"
             if last_date:
                 try:
-                    last_dt = datetime.datetime.strptime(
-                        last_date, "%Y-%m-%d %H:%M:%S"
-                    )
-                    current_dt = datetime.datetime.strptime(
-                        timestamp, "%Y-%m-%d %H:%M:%S"
-                    )
+                    last_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d %H:%M:%S")
+                    current_dt = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
                     days_lost = (current_dt - last_dt).days
                 except Exception:
                     pass
 
-            ws_lost.append(
-                [
-                    domain,
-                    keyword,
-                    last_position or "—",
-                    last_date or "—",
-                    days_lost,
-                ]
-            )
+            ws_lost.append([domain, keyword, last_position or "—", last_date or "—", days_lost])
             for c in range(1, 6):
-                ws_lost.cell(row=ws_lost.max_row, column=c).fill = PatternFill(
-                    "solid", "FFB6C1"
-                )
-                ws_lost.cell(row=ws_lost.max_row, column=c).font = Font(
-                    color="8B0000"
-                )
+                ws_lost.cell(row=ws_lost.max_row, column=c).fill = PatternFill("solid", "FFB6C1")
+                ws_lost.cell(row=ws_lost.max_row, column=c).font = Font(color="8B0000")
 
-    # 6. History Summary — по кожному бакету
+    # 6. History Summary
     ws_hist = wb.create_sheet("History Summary")
     headers_hist = ["Date", "Total Found", "Avg Pos"] + BUCKET_LABELS
     style_header(ws_hist, headers_hist)
 
     full_hist = history + [{"timestamp": timestamp, "results": all_rows}]
     for entry in full_hist:
-        targets = [
-            r for r in entry.get("results", []) if r.get("Is_Target")
-        ]
+        targets = [r for r in entry.get("results", []) if r.get("Is_Target")]
         if not targets:
             continue
         pos = [r["Position"] for r in targets]
         avg_pos = round(sum(pos) / len(pos), 1) if pos else 0
 
-        row = [
-            entry.get("timestamp", "—"),
-            len(targets),
-            avg_pos,
-        ]
-
+        row = [entry.get("timestamp", "—"), len(targets), avg_pos]
         for (start, end) in BUCKET_RANGES:
             row.append(sum(1 for p in pos if start <= p <= end))
-
         ws_hist.append(row)
 
-    # автоширина колонок для всіх аркушів
     for ws in wb.worksheets:
         autosize_columns(ws, max_width=100)
 
