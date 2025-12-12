@@ -221,6 +221,15 @@ def main():
 
     print("Бот запущений. Автопарсинг усіх проєктів (топ-30) кожні 3 години")
     app.run_polling(drop_pending_updates=True)
+# Для Render Web Service — просто "обдурюємо" його, що порт відкритий
+import os
+from threading import Thread
 
+def fake_web():
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), 
+               lambda *args: None).serve_forever()
+
+Thread(target=fake_web, daemon=True).start()
 if __name__ == "__main__":
     main()
