@@ -17,10 +17,10 @@ from telegram.ext import (
 from parser_core import run_project, load_history
 
 # =========================
-# НАЛАШТУВАННЯ (токен і твій ID — жорстко в коді, як ти хочеш)
+# НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-ADMIN_CHAT_ID = 8146349890  # ← твій Telegram ID (той самий, що й у токені — це нормально для особистих ботів)
+ADMIN_CHAT_ID = 8146349890  # ← твій ID (заміни, якщо інший)
 
 PROJECTS_FILE = "projects.json"
 MIN_KEYWORDS_FOR_ALERT = 2
@@ -40,13 +40,8 @@ def load_projects():
 PROJECTS = load_projects()
 PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
 
-def reload_projects():
-    global PROJECTS, PROJECTS_BY_NAME
-    PROJECTS = load_projects()
-    PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
-
 # =========================
-# HELPERS + ANALYTICS
+# HELPERS + ANALYTICS (без змін)
 # =========================
 def resolve_output_path(raw) -> Optional[Path]:
     if isinstance(raw, (str, Path)):
@@ -92,69 +87,58 @@ def analyze_changes():
     return drops, new_domains
 
 # =========================
-# USER STATE + Клавіатури (залишай свої функції як були)
-# =========================
-def get_state(context):
-    ud = context.user_data
-    ud.setdefault("projects", set())
-    ud.setdefault("pages", 3)
-    return ud
-
-# ← Тут встав свої kb_main, kb_projects, kb_pages, kb_delete, kb_confirm — без змін
-
-# =========================
-# HANDLERS (залишай як було)
-# =========================
-# ← Тут встав свої async def start(), callback(), run_parsing() — без змін
-
-# =========================
-# АВТОПАРСИНГ КОЖНІ 3 ГОДИНИ — ВСІ ПРОЄКТИ
+# АВТОПАРСИНГ — ТІЛЬКИ ПАРСИНГ, БЕЗ МЕНЮ
 # =========================
 async def auto_parsing_task():
     while True:
         try:
-            print(f"[{datetime.now()}] Автоматичний парсинг усіх проєктів...")
-            pages = 3  # кількість сторінок для автопарсингу
+            print(f"[{datetime.now()}] Автоматичний парсинг усіх проєктів (топ-30)...")
+            
+            pages = 3  # саме 3 сторінки = топ-30
+            projects_to_parse = list(PROJECTS_BY_NAME.keys())  # усі проєкти з projects.json
+            
+            if not projects_to_parse:
+                await application.bot.send_message(ADMIN_CHAT_ID, "Немає проєктів у projects.json")
+                await asyncio.sleep(3 * 60 * 60)
+                continue
 
-            for name in PROJECTS_BY_NAME.keys():
+            for name in projects_to_parse:
                 cfg = dict(PROJECTS_BY_NAME[name])
                 cfg["max_positions"] = pages * 10
 
-                await application.bot.send_message(ADMIN_CHAT_ID, f"Авто: {name}")
+                print(f"Парсинг: {name}")
                 raw = await run_project(cfg)
                 path = resolve_output_path(raw)
 
-                if path and path.exists():
-                    path = rename_excel(path, pages)
-                    drops, new_domains = analyze_changes()
+                if not path or not path.exists():
+                    await application.bot.send_message(ADMIN_CHAT_ID, f"Не вдалося створити файл для {name}")
+                    continue
 
-                    if drops:
-                        msg = ["DROP:"]
-                        for d, b, c in drops:
-                            msg.append(f"{d}: {b} → {c}")
-                        await application.bot.send_message(ADMIN_CHAT_ID, "\n".join(msg))
-                    if new_domains:
-                        msg = ["NEW DOMAINS:"]
-                        for d, c in new_domains:
-                            msg.append(f"{d}: {c} keywords")
-                        await application.bot.send_message(ADMIN_CHAT_ID, "\n".join(msg))
+                path = rename_excel(path, pages)
+                drops, new_domains = analyze_changes()
 
-                    with path.open("rb") as f:
-                        await application.bot.send_document(
-                            ADMIN_CHAT_ID,
-                            document=f,
-                            filename=path.name
-                        )
-                else:
-                    await application.bot.send_message(ADMIN_CHAT_ID, f"Файл не знайдено: {name}")
+                # Коротке повідомлення
+                msg = f"Готовий файл для {name} (топ-30)\n"
+                if drops:
+                    msg += "DROP: " + ", ".join([f"{d} ({b}→{c})" for d, b, c in drops]) + "\n"
+                if new_domains:
+                    msg += "NEW: " + ", ".join([f"{d} ({c} ключів)" for d, c in new_domains])
+                await application.bot.send_message(ADMIN_CHAT_ID, msg)
 
-            await application.bot.send_message(ADMIN_CHAT_ID, "Автопарсинг усіх проєктів завершено!")
+                # Відправляємо файл
+                with path.open("rb") as f:
+                    await application.bot.send_document(
+                        ADMIN_CHAT_ID,
+                        document=f,
+                        filename=path.name
+                    )
+
+            await application.bot.send_message(ADMIN_CHAT_ID, "Автопарсинг усіх проєктів завершено. Наступний через 3 години.")
 
         except Exception as e:
             print("Помилка автопарсингу:", e)
-            await application.bot.send_message(ADMIN_CHAT_ID, f"Помилка: {e}")
+            await application.bot.send_message(ADMIN_CHAT_ID, f"Помилка автопарсингу: {e}")
 
-        print("Наступний автопарсинг через 3 години...")
         await asyncio.sleep(3 * 60 * 60)  # 3 години
 
 # =========================
@@ -162,14 +146,15 @@ async def auto_parsing_task():
 # =========================
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+# Залишаємо меню тільки для ручного запуску
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CallbackQueryHandler(callback))
 
 async def main():
-    # Фоновий автопарсинг
+    # Запускаємо автопарсинг у фоні
     asyncio.create_task(auto_parsing_task())
     
-    print("Бот запущений. Автопарсинг усіх проєктів кожні 3 години активний.")
+    print("Бот запущений. Автоматичний парсинг усіх проєктів (топ-30) кожні 3 години активний.")
     await application.run_polling()
 
 if __name__ == "__main__":
