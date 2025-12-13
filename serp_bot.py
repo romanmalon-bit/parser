@@ -16,42 +16,31 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-from openpyxl import load_workbook
-
-from parser_core import run_project  # parser_core.py НЕ чіпаємо
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
+from parser_core import run_project  # НЕ чіпаємо parser_core.py
 
 # =========================
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
-
 PROJECTS_FILE = "projects.json"
+USERS_FILE = "users.txt"
+ADMIN_FILE = "admin_chat_id.txt"
+LAST_HISTORY_DIR = "last_history"  # Папка для зберігання останньої історії кожного проєкту
 
-# ✅ Твій chat_id (fallback). ENV має пріоритет.
 DEFAULT_ADMIN_CHAT_ID = 909587225
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", str(DEFAULT_ADMIN_CHAT_ID)))
-
-ADMIN_FILE = "admin_chat_id.txt"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================
-# Conversation: ДОДАВАННЯ ПРОЄКТУ
-# =========================
-(
-    NAME, LOCATION, LANGUAGE, API_KEYS, TARGET_DOMAINS, KEYWORDS, OUTPUT_PREFIX, HISTORY_FILE
-) = range(8)
-
-# =========================
-# ADMIN CHAT ID
+# ADMIN & USERS
 # =========================
 def load_admin_chat_id() -> int:
-    # 1) ENV
     if ADMIN_CHAT_ID:
         return ADMIN_CHAT_ID
-    # 2) файл
     try:
         if os.path.exists(ADMIN_FILE):
             return int(Path(ADMIN_FILE).read_text(encoding="utf-8").strip())
@@ -62,15 +51,42 @@ def load_admin_chat_id() -> int:
 def save_admin_chat_id(chat_id: int):
     Path(ADMIN_FILE).write_text(str(chat_id), encoding="utf-8")
 
+def load_users() -> set[int]:
+    if not os.path.exists(USERS_FILE):
+        return set()
+    try:
+        return {int(line.strip()) for line in Path(USERS_FILE).read_text(encoding="utf-8").splitlines() if line.strip()}
+    except Exception:
+        return set()
+
+def save_users(users: set[int]):
+    Path(USERS_FILE).write_text("\n".join(map(str, sorted(users))), encoding="utf-8")
+
+def add_user(chat_id: int):
+    users = load_users()
+    if chat_id not in users:
+        users.add(chat_id)
+        save_users(users)
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     save_admin_chat_id(chat_id)
     await update.message.reply_text(f"✅ ADMIN_CHAT_ID встановлено: {chat_id}")
 
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != load_admin_chat_id():
+        await update.message.reply_text("❌ Доступ заборонено.")
+        return
+    users = load_users()
+    if not users:
+        await update.message.reply_text("Активних користувачів немає.")
+        return
+    text = f"👥 Активні користувачі ({len(users)}):\n" + "\n".join(map(str, sorted(users)))
+    await update.message.reply_text(text)
+
 async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: str):
     admin_id = load_admin_chat_id()
     if not admin_id:
-        logger.error("ADMIN_CHAT_ID не заданий. Додай ENV ADMIN_CHAT_ID або виконай /admin")
         return
     try:
         await context.bot.send_message(
@@ -88,8 +104,11 @@ def load_projects() -> List[dict]:
         with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
             json.dump({"projects": []}, f, ensure_ascii=False, indent=2)
         return []
-    with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f).get("projects", [])
+    try:
+        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("projects", [])
+    except Exception:
+        return []
 
 def save_projects(projects: List[dict]):
     with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
@@ -104,7 +123,7 @@ def reload_projects():
     PROJECTS_BY_NAME = {p["name"]: p for p in PROJECTS}
 
 # =========================
-# STATE (меню)
+# STATE
 # =========================
 def get_state(context: ContextTypes.DEFAULT_TYPE):
     if "state" not in context.user_data:
@@ -112,7 +131,7 @@ def get_state(context: ContextTypes.DEFAULT_TYPE):
     return context.user_data["state"]
 
 # =========================
-# SAFE SEND HELPERS
+# SAFE SEND
 # =========================
 async def _safe_send_message(bot, chat_id: int, text: str) -> bool:
     if not chat_id:
@@ -121,7 +140,7 @@ async def _safe_send_message(bot, chat_id: int, text: str) -> bool:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         return True
     except Exception as e:
-        logger.error("send_message failed (chat_id=%s): %s", chat_id, e)
+        logger.warning("send_message failed for %s: %s", chat_id, e)
         return False
 
 async def _safe_send_document(bot, chat_id: int, path: Path, caption: str) -> bool:
@@ -132,7 +151,7 @@ async def _safe_send_document(bot, chat_id: int, path: Path, caption: str) -> bo
             await bot.send_document(chat_id=chat_id, document=f, caption=caption)
         return True
     except Exception as e:
-        logger.error("send_document failed (chat_id=%s, file=%s): %s", chat_id, path, e)
+        logger.warning("send_document failed for %s: %s", chat_id, e)
         return False
 
 # =========================
@@ -166,62 +185,46 @@ def find_previous_report(output_prefix: str, current_path: Path) -> Optional[Pat
     return candidates[0]
 
 def read_target_domain_stats(xlsx_path: Path) -> Dict[str, Dict[str, float]]:
-    """
-    Повертає:
-      domain -> {"kw": int, "score": float}
-    З листа 'Target Domains Stats'.
-    Колонки: Domain | ... | Score | Keywords
-    """
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     if "Target Domains Stats" not in wb.sheetnames:
         return {}
     ws = wb["Target Domains Stats"]
-
     header_cells = next(ws.iter_rows(min_row=1, max_row=1))
     header = [str(c.value).strip() if c.value is not None else "" for c in header_cells]
     idx = {name: i for i, name in enumerate(header)}
-
     domain_i = idx.get("Domain")
     kw_i = idx.get("Keywords")
     score_i = idx.get("Score")
-    total_i = idx.get("Total")  # фолбек
-
+    total_i = idx.get("Total")
     if domain_i is None:
         return {}
-
     out: Dict[str, Dict[str, float]] = {}
-
     for row in ws.iter_rows(min_row=2):
         domain = row[domain_i].value
         if not domain:
             continue
         domain = str(domain).strip().lower()
-
         kw_count = 0
         if kw_i is not None:
             cell = row[kw_i].value
             if cell:
                 kws = [k.strip() for k in str(cell).split(";") if k.strip()]
                 kw_count = len(set(kws))
-
         if kw_count == 0 and total_i is not None:
             try:
                 kw_count = int(row[total_i].value or 0)
             except Exception:
                 kw_count = 0
-
         score = 0.0
         if score_i is not None:
             try:
                 score = float(row[score_i].value or 0)
             except Exception:
                 score = 0.0
-
         out[domain] = {"kw": float(kw_count), "score": score}
-
     return out
 
-def _badge(prev: float, now: float, severe_rule=True) -> str:
+def _badge(prev: float, now: float) -> str:
     if prev == 0 and now > 0:
         return "🟢"
     if prev > 0 and now == 0:
@@ -229,7 +232,7 @@ def _badge(prev: float, now: float, severe_rule=True) -> str:
     if now > prev:
         return "🟢"
     if now < prev:
-        if severe_rule and (now * 2 < prev):
+        if now * 2 < prev:
             return "🟥"
         return "🔻"
     return "⚪"
@@ -237,25 +240,14 @@ def _badge(prev: float, now: float, severe_rule=True) -> str:
 def format_delta_report(prev_map: Dict[str, Dict[str, float]],
                         cur_map: Dict[str, Dict[str, float]],
                         top_n: int = 30) -> str:
-    """
-    Порівнюємо:
-      - kw: скільки ключів по домену
-      - score: Score
-    Показуємо топ змін за kw (по модулю), а також score дельту.
-    """
     domains = sorted(set(prev_map.keys()) | set(cur_map.keys()))
-
     rows: List[Tuple[float, str, float, float, float, float]] = []
-    # tuple: (abs_kw_delta, domain, prev_kw, now_kw, prev_score, now_score)
-
     summary = {"kw_up": 0, "kw_down": 0, "kw_severe": 0, "kw_new": 0, "kw_lost": 0, "kw_same": 0}
-
     for d in domains:
         pkw = float(prev_map.get(d, {}).get("kw", 0))
         nkw = float(cur_map.get(d, {}).get("kw", 0))
         ps = float(prev_map.get(d, {}).get("score", 0))
         ns = float(cur_map.get(d, {}).get("score", 0))
-
         if pkw == 0 and nkw > 0:
             summary["kw_new"] += 1
         elif pkw > 0 and nkw == 0:
@@ -270,13 +262,10 @@ def format_delta_report(prev_map: Dict[str, Dict[str, float]],
                 summary["kw_severe"] += 1
         else:
             summary["kw_same"] += 1
-
         if nkw != pkw or ns != ps:
             rows.append((abs(nkw - pkw), d, pkw, nkw, ps, ns))
-
     rows.sort(key=lambda x: x[0], reverse=True)
     rows = rows[:top_n]
-
     lines = []
     lines.append(
         f"📊 *Динаміка vs попередній парсинг*\n"
@@ -284,27 +273,56 @@ def format_delta_report(prev_map: Dict[str, Dict[str, float]],
     )
     lines.append("")
     lines.append("```")
-    lines.append("KW | Prev→Now | ΔKW | SCORE | Prev→Now | ΔS  | Domain")
+    lines.append("KW | Prev→Now | ΔKW | SCORE | Prev→Now | ΔS | Domain")
     lines.append("---+----------+-----+-------+----------+-----+------------------------------")
-
     for _, d, pkw, nkw, ps, ns in rows:
-        kw_badge = _badge(pkw, nkw, severe_rule=True)
-        score_badge = _badge(ps, ns, severe_rule=True)
-
+        kw_badge = _badge(pkw, nkw)
+        score_badge = _badge(ps, ns)
         dkw = int(nkw - pkw)
         ds = ns - ps
-
         dom = d[:30]
         lines.append(
-            f"{kw_badge}  {int(pkw):>3}→{int(nkw):<3} {dkw:+4}   "
-            f"{score_badge}   {ps:>5.0f}→{ns:<5.0f} {ds:+5.0f}  {dom}"
+            f"{kw_badge} {int(pkw):>3}→{int(nkw):<3} {dkw:+4} "
+            f"{score_badge} {ps:>5.0f}→{ns:<5.0f} {ds:+5.0f} {dom}"
         )
-
     if not rows:
         lines.append("Нема змін у порівнянні з попереднім парсингом.")
     lines.append("```")
-
     return "\n".join(lines)
+
+# Нова функція: додати історію тільки якщо це не перший парсинг
+def add_history_sheet_if_needed(xlsx_path: Path, project_name: str):
+    history_path = Path(LAST_HISTORY_DIR) / f"{project_name}.json"
+    Path(LAST_HISTORY_DIR).mkdir(exist_ok=True)
+
+    # Зберігаємо поточні дані як останню історію
+    try:
+        wb = load_workbook(xlsx_path, read_only=False)
+        data_to_save = {}
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            data = []
+            for row in ws.iter_rows(values_only=True):
+                data.append(row)
+            data_to_save[sheet_name] = data
+        history_path.write_text(json.dumps(data_to_save, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Якщо це НЕ перший парсинг — додаємо лист "History"
+        prev_reports = list(Path(".").rglob(f"*_{project_name}_*.xlsx"))  # грубий пошук за назвою проєкту
+        if len(prev_reports) > 1 or history_path.stat().st_size > 10:  # вже є історія
+            if "History" in wb.sheetnames:
+                wb.remove(wb["History"])
+            history_ws = wb.create_sheet("History")
+            if history_path.exists():
+                old_data = json.loads(history_path.read_text(encoding="utf-8"))
+                for sheet_name, rows in old_data.items():
+                    history_ws.append([f"=== Попередній парсинг: {sheet_name} ==="])
+                    for row in rows:
+                        history_ws.append(row)
+                    history_ws.append([])  # порожній рядок між листами
+        wb.save(xlsx_path)
+    except Exception as e:
+        logger.error(f"Помилка при додаванні історії для {project_name}: {e}")
 
 # =========================
 # КЛАВІАТУРИ
@@ -355,25 +373,23 @@ def kb_delete():
     return InlineKeyboardMarkup(buttons)
 
 # =========================
-# START
+# START & CALLBACK
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    add_user(chat_id)
     st = get_state(context)
-    await update.effective_chat.send_message(
+    await update.effective_message.reply_text(
         "Привіт! Це бот для парсингу SERP.\n"
         "— Ручний парсинг: виберіть проєкти + сторінки і натисніть ▶️\n"
-        "— Автопарсинг: кожні 3 години (TOP-30)\n\n"
-        "Оберіть опцію в меню:",
+        "— Автопарсинг: кожні 3 години (TOP-30), звіти всім користувачам\n\n"
+        "Оберіть опцію:",
         reply_markup=kb_main(st)
     )
 
-# =========================
-# CALLBACK
-# =========================
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     st = get_state(context)
     data = query.data
     chat_id = query.message.chat_id
@@ -382,7 +398,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reload_projects()
         await query.edit_message_text("Виберіть проєкти:", reply_markup=kb_projects(st))
         return
-
     if data.startswith("toggle:"):
         name = data.split(":", 1)[1]
         if name in st["projects"]:
@@ -391,28 +406,21 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["projects"].append(name)
         await query.edit_message_reply_markup(reply_markup=kb_projects(st))
         return
-
     if data == "pages":
         await query.edit_message_text("Оберіть кількість сторінок:", reply_markup=kb_pages())
         return
-
     if data.startswith("setpages:"):
         st["pages"] = int(data.split(":")[1])
         await query.edit_message_text("Оновлено.", reply_markup=kb_main(st))
         return
-
     if data == "run":
         if not st["projects"]:
-            await query.edit_message_text("Спочатку оберіть хоча б один проєкт.", reply_markup=kb_main(st))
+            await query.edit_message_text("Оберіть хоча б один проєкт.", reply_markup=kb_main(st))
             return
-
         pages = int(st["pages"])
         top_n = pages * 10
-
         await query.edit_message_text(
-            f"⏳ Старт ручного парсингу\n"
-            f"Проєктів: {len(st['projects'])}\n"
-            f"Сторінок: {pages} (TOP {top_n})\n",
+            f"⏳ Ручний парсинг запущено\nПроєктів: {len(st['projects'])}\nTOP: {top_n}",
             reply_markup=kb_main(st)
         )
 
@@ -422,26 +430,21 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reload_projects()
                     project = PROJECTS_BY_NAME.get(name)
                     if not project:
-                        await _safe_send_message(context.bot, chat_id, f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено.")
+                        await _safe_send_message(context.bot, chat_id, f"⚠️ [{i}] Проєкт «{name}» не знайдено.")
                         continue
-
-                    project_cfg = dict(project)
-                    project_cfg["max_positions"] = top_n  # ✅ ключова логіка сторінок
-                    output_prefix = project_cfg.get("output_prefix", "report")
+                    cfg = dict(project)
+                    cfg["max_positions"] = top_n
+                    output_prefix = cfg.get("output_prefix", "report")
 
                     await _safe_send_message(
-                        context.bot,
-                        chat_id,
-                        f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»\n"
-                        f"Гео: {project_cfg.get('location')} | TOP: {top_n} | Сторінок: {pages}\n"
-                        f"Ключів: {len(project_cfg.get('keywords', []))} | Домени: {len(project_cfg.get('target_domains', []))}"
+                        context.bot, chat_id,
+                        f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}» (TOP {top_n})"
                     )
-
                     start_ts = datetime.now().timestamp()
                     started_msg = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     try:
-                        out_path = await run_project(project_cfg)
+                        out_path = await run_project(cfg)
                     except Exception as e:
                         await _safe_send_message(context.bot, chat_id, f"🚨 Помилка в «{name}»: {e}")
                         await send_error_to_admin(context, f"Помилка в «{name}»: {e}")
@@ -456,10 +459,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         xlsx_path = find_latest_xlsx(start_ts)
 
                     if xlsx_path and xlsx_path.exists():
-                        await _safe_send_message(context.bot, chat_id, f"✅ «{name}» готово.\nПочаток: {started_msg}\nФайл: {xlsx_path.name}")
+                        # Додаємо історію (тільки якщо це не перший парсинг)
+                        add_history_sheet_if_needed(xlsx_path, name)
+
+                        await _safe_send_message(context.bot, chat_id, f"✅ «{name}» готово ({started_msg})")
                         await _safe_send_document(context.bot, chat_id, xlsx_path, caption=xlsx_path.name)
 
-                        # ✅ ДИНАМІКА (keywords + score)
                         prev_xlsx = find_previous_report(output_prefix, xlsx_path)
                         if prev_xlsx and prev_xlsx.exists():
                             prev_stats = read_target_domain_stats(prev_xlsx)
@@ -467,33 +472,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             msg = format_delta_report(prev_stats, cur_stats, top_n=30)
                             await _safe_send_message(context.bot, chat_id, msg)
                         else:
-                            await _safe_send_message(context.bot, chat_id, "ℹ️ Це перший звіт для цього проєкту — порівнювати поки немає з чим.")
+                            await _safe_send_message(context.bot, chat_id, "ℹ️ Це перший звіт — порівняння немає.")
                     else:
-                        await _safe_send_message(
-                            context.bot,
-                            chat_id,
-                            f"✅ «{name}» готово, але Excel файл не знайдено.\n"
-                            f"Початок: {started_msg}\n"
-                            "Перевір робочу директорію Render та права запису."
-                        )
-
+                        await _safe_send_message(context.bot, chat_id, f"✅ «{name}» виконано, але файл не знайдено.")
                 await _safe_send_message(context.bot, chat_id, "🏁 Ручний парсинг завершено.")
             except Exception as e:
-                logger.exception("runner crashed: %s", e)
-                await send_error_to_admin(context, f"runner crashed: {e}")
+                logger.exception("runner error: %s", e)
+                await send_error_to_admin(context, f"runner error: {e}")
 
         context.application.create_task(runner())
         return
 
     if data == "add_project":
-        await query.edit_message_text("Запусти команду /addproject")
+        await query.edit_message_text("Запустіть команду /addproject")
         return
-
     if data == "delete":
         reload_projects()
         await query.edit_message_text("Оберіть проєкт для видалення:", reply_markup=kb_delete())
         return
-
     if data.startswith("del:"):
         name = data.split(":", 1)[1]
         projects = load_projects()
@@ -504,19 +500,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["projects"].remove(name)
         await query.edit_message_text(f"Проєкт «{name}» видалено.", reply_markup=kb_main(st))
         return
-
     if data == "info":
         await query.edit_message_text(
-            "ℹ️ Команди:\n"
-            "/start — меню\n"
-            "/addproject — додати проєкт\n"
-            "/cancel — скасувати додавання\n"
-            "/admin — встановити чат для алертів\n\n"
-            "Після кожного парсингу бот шле Excel + динаміку (Keywords + Score).",
+            "ℹ️ Команди:\n/start — меню\n/addproject — додати проєкт\n/cancel — скасувати\n/admin — алерти помилок",
             reply_markup=kb_main(st)
         )
         return
-
     if data == "back":
         await query.edit_message_text("Меню:", reply_markup=kb_main(st))
         return
@@ -524,10 +513,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Невідома дія: {data}", reply_markup=kb_main(st))
 
 # =========================
-# Conversation: ДОДАВАННЯ ПРОЄКТУ
+# ДОДАВАННЯ ПРОЄКТУ
 # =========================
+(NAME, LOCATION, LANGUAGE, API_KEYS, TARGET_DOMAINS, KEYWORDS, OUTPUT_PREFIX, HISTORY_FILE) = range(8)
+
 async def start_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Почнемо додавання нового проєкту!\n\nКрок 1: Введіть назву проєкту")
+    await update.message.reply_text("Крок 1: Введіть назву проєкту")
     context.user_data["new_project"] = {}
     return NAME
 
@@ -535,7 +526,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reload_projects()
     name = update.message.text.strip()
     if name in PROJECTS_BY_NAME:
-        await update.message.reply_text(f"Проєкт з назвою «{name}» вже існує. Спробуйте іншу назву.")
+        await update.message.reply_text(f"Проєкт «{name}» вже існує. Інша назва?")
         return NAME
     context.user_data["new_project"]["name"] = name
     await update.message.reply_text("Крок 2: Введіть країну (location, наприклад: France)")
@@ -543,167 +534,152 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_project"]["location"] = update.message.text.strip()
-    await update.message.reply_text("Крок 3: Введіть код мови (hl та gl, наприклад: fr)")
+    await update.message.reply_text("Крок 3: Введіть код мови (hl/gl, наприклад: fr)")
     return LANGUAGE
 
 async def get_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = update.message.text.strip()
     context.user_data["new_project"]["hl"] = lang
     context.user_data["new_project"]["gl"] = lang
-    await update.message.reply_text("Крок 4: Введіть API ключі (через кому, якщо кілька)")
+    await update.message.reply_text("Крок 4: API ключі (через кому)")
     return API_KEYS
 
 async def get_api_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys = [k.strip() for k in update.message.text.split(",") if k.strip()]
     context.user_data["new_project"]["api_keys"] = keys
-    await update.message.reply_text("Крок 5: Введіть таргет-домени (по одному на рядок або через кому)")
+    await update.message.reply_text("Крок 5: Таргет-домени (по одному на рядок або через кому)")
     return TARGET_DOMAINS
 
 async def get_target_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domains = [d.strip() for d in update.message.text.replace(",", "\n").split("\n") if d.strip()]
     context.user_data["new_project"]["target_domains"] = domains
-    await update.message.reply_text("Крок 6: Введіть ключові слова (по одному на рядок або через кому)")
+    await update.message.reply_text("Крок 6: Ключові слова (по одному на рядок або через кому)")
     return KEYWORDS
 
 async def get_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keywords = [k.strip() for k in update.message.text.replace(",", "\n").split("\n") if k.strip()]
     context.user_data["new_project"]["keywords"] = keywords
-    await update.message.reply_text("Крок 7: Введіть префікс вихідного файлу (наприклад: serp_top30_FR)")
+    await update.message.reply_text("Крок 7: Префікс файлу (наприклад: serp_fr)")
     return OUTPUT_PREFIX
 
 async def get_output_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_project"]["output_prefix"] = update.message.text.strip()
-    await update.message.reply_text("Крок 8: Введіть ім'я файлу історії (наприклад: serp_history_FR.json)")
+    await update.message.reply_text("Крок 8: Ім'я файлу історії (наприклад: history_fr.json) — можна будь-яке")
     return HISTORY_FILE
 
 async def get_history_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    history_file = update.message.text.strip()
-    context.user_data["new_project"]["history_file"] = history_file
-
+    context.user_data["new_project"]["history_file"] = update.message.text.strip()
     new_project = context.user_data["new_project"]
-
     projects = load_projects()
     projects.append(new_project)
     save_projects(projects)
     reload_projects()
 
-    history_path = Path(history_file)
-    if not history_path.exists():
-        history_path.write_text(json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8")
-
     await update.message.reply_text(
-        f"✅ Проєкт «{new_project['name']}» успішно додано!\nПовертаюсь у меню.",
+        f"✅ Проєкт «{new_project['name']}» додано!\nПовертаюсь у меню.",
         reply_markup=kb_main(get_state(context))
     )
     context.user_data.pop("new_project", None)
     return ConversationHandler.END
 
 async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Додавання проєкту скасовано.", reply_markup=kb_main(get_state(context)))
+    await update.message.reply_text("❌ Скасовано.", reply_markup=kb_main(get_state(context)))
     context.user_data.pop("new_project", None)
     return ConversationHandler.END
 
 # =========================
-# AUTO PARSING (кожні 3 години, TOP-30)
+# AUTO PARSING
 # =========================
 AUTO_LOCK = asyncio.Lock()
 
 async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("AUTO fired at %s UTC", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-
+    logger.info("Автопарсинг запущено")
     if AUTO_LOCK.locked():
-        logger.warning("AUTO skipped: previous run still in progress")
+        logger.warning("Попередній автопарсинг ще триває")
         return
 
     async with AUTO_LOCK:
-        admin_id = load_admin_chat_id()
-        if not admin_id:
-            logger.warning("AUTO skipped: admin chat id is not set. Do /admin or set ADMIN_CHAT_ID env.")
+        users = load_users()
+        if not users:
             return
 
-        try:
-            reload_projects()
-            if not PROJECTS:
-                await _safe_send_message(context.bot, admin_id, "⚠️ Автопарсинг: projects.json порожній — проєктів нема.")
-                return
+        reload_projects()
+        if not PROJECTS:
+            for uid in users:
+                await _safe_send_message(context.bot, uid, "⚠️ Немає проєктів для автопарсингу")
+            return
 
-            await _safe_send_message(
-                context.bot,
-                admin_id,
-                f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (TOP-30)."
-            )
+        for uid in users:
+            await _safe_send_message(context.bot, uid, f"🤖 Автопарсинг стартував ({len(PROJECTS)} проєктів, TOP-30)")
 
-            for i, project in enumerate(PROJECTS, start=1):
-                name = project.get("name", "Unnamed")
-                cfg = dict(project)
-                cfg["max_positions"] = 30
-                output_prefix = cfg.get("output_prefix", "report")
+        for i, project in enumerate(PROJECTS, start=1):
+            name = project.get("name", "Unnamed")
+            cfg = dict(project)
+            cfg["max_positions"] = 30
+            output_prefix = cfg.get("output_prefix", "report")
 
-                await _safe_send_message(
-                    context.bot,
-                    admin_id,
-                    f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»… "
-                    f"Ключів: {len(cfg.get('keywords', []))} | Доменів: {len(cfg.get('target_domains', []))}"
-                )
+            for uid in users:
+                await _safe_send_message(context.bot, uid, f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»")
 
-                start_ts = datetime.now().timestamp()
+            start_ts = datetime.now().timestamp()
+            try:
                 out_path = await run_project(cfg)
+            except Exception as e:
+                msg = f"🚨 Помилка в «{name}»: {e}"
+                for uid in users:
+                    await _safe_send_message(context.bot, uid, msg)
+                await send_error_to_admin(context, msg)
+                continue
 
-                xlsx_path = None
-                if isinstance(out_path, str) and out_path.strip():
-                    p = Path(out_path)
-                    if p.exists():
-                        xlsx_path = p
-                if xlsx_path is None:
-                    xlsx_path = find_latest_xlsx(start_ts)
+            xlsx_path = None
+            if isinstance(out_path, str) and out_path.strip():
+                p = Path(out_path)
+                if p.exists():
+                    xlsx_path = p
+            if xlsx_path is None:
+                xlsx_path = find_latest_xlsx(start_ts)
 
-                if xlsx_path and xlsx_path.exists():
-                    await _safe_send_message(context.bot, admin_id, f"✅ «{name}» готово. Файл: {xlsx_path.name}")
-                    await _safe_send_document(context.bot, admin_id, xlsx_path, caption=f"AUTO {xlsx_path.name}")
+            if xlsx_path and xlsx_path.exists():
+                add_history_sheet_if_needed(xlsx_path, name)
 
-                    # ✅ ДИНАМІКА (keywords + score)
+                for uid in users:
+                    await _safe_send_message(context.bot, uid, f"✅ «{name}» готово")
+                    await _safe_send_document(context.bot, uid, xlsx_path, caption=f"AUTO {xlsx_path.name}")
+
                     prev_xlsx = find_previous_report(output_prefix, xlsx_path)
                     if prev_xlsx and prev_xlsx.exists():
                         prev_stats = read_target_domain_stats(prev_xlsx)
                         cur_stats = read_target_domain_stats(xlsx_path)
-                        msg = format_delta_report(prev_stats, cur_stats, top_n=30)
-                        await _safe_send_message(context.bot, admin_id, msg)
+                        msg = format_delta_report(prev_stats, cur_stats)
+                        await _safe_send_message(context.bot, uid, msg)
                     else:
-                        await _safe_send_message(context.bot, admin_id, "ℹ️ Це перший звіт для цього проєкту — порівнювати поки немає з чим.")
-                else:
-                    await _safe_send_message(context.bot, admin_id, f"✅ «{name}» готово, але Excel файл не знайдено.")
+                        await _safe_send_message(context.bot, uid, "ℹ️ Перший автозвіт — порівняння немає.")
+            else:
+                for uid in users:
+                    await _safe_send_message(context.bot, uid, f"✅ «{name}» виконано, але файл не знайдено.")
 
-            await _safe_send_message(context.bot, admin_id, "🏁 Автопарсинг завершено.")
-
-        except Exception as e:
-            logger.exception("auto_parsing_task crashed: %s", e)
-            await _safe_send_message(context.bot, admin_id, f"🚨 Автопарсинг впав: {e}")
-            await send_error_to_admin(context, f"auto_parsing_task crashed: {e}")
+        for uid in users:
+            await _safe_send_message(context.bot, uid, "🏁 Автопарсинг завершено.")
 
 # =========================
-# ERROR HANDLER
+# ERROR & MAIN
 # =========================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception:", exc_info=context.error)
-    try:
-        await send_error_to_admin(context, str(context.error))
-    except Exception:
-        pass
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Помилка: %s", context.error)
+    await send_error_to_admin(context, str(context.error))
 
-# =========================
-# MAIN
-# =========================
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Set it in Render Environment variables.")
+        raise RuntimeError("Встановіть TELEGRAM_BOT_TOKEN у змінних середовища Render!")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(callback))
 
-    add_conv = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("addproject", start_add_project)],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
@@ -717,14 +693,12 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_add_project)],
     )
-    app.add_handler(add_conv)
-
+    app.add_handler(conv)
     app.add_error_handler(error_handler)
 
-    # ✅ автопарсинг кожні 3 години
-    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
+    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)  # кожні 3 години
 
-    logger.info("Бот запущений.")
+    logger.info("Бот запущено")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
