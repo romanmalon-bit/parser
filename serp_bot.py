@@ -674,11 +674,13 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Хендлери
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(callback))
 
+    # Конверсація для додавання проєкту
     conv = ConversationHandler(
         entry_points=[CommandHandler("addproject", start_add_project)],
         states={
@@ -694,12 +696,26 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add_project)],
     )
     app.add_handler(conv)
+
+    # Обробка помилок
     app.add_error_handler(error_handler)
 
-    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)  # кожні 3 години
+    # Автопарсинг кожні 3 години (10800 секунд), перший запуск через 60 секунд
+    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
 
-    logger.info("Бот запущено")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Бот запущено та готовий до роботи")
+
+    # ✅ Граціозне завершення при перезапуску/деплої на Render
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Отримано сигнал завершення — зупиняємо бота...")
+    finally:
+        # Коректно зупиняємо бота, щоб звільнити getUpdates
+        asyncio.run(app.stop())
+        asyncio.run(app.shutdown())
+        logger.info("Бот успішно зупинено")
+
 
 if __name__ == "__main__":
     main()
