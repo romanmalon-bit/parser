@@ -668,19 +668,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Помилка: %s", context.error)
     await send_error_to_admin(context, str(context.error))
 
+import asyncio
+import signal
+import os
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("Встановіть TELEGRAM_BOT_TOKEN у змінних середовища Render!")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Хендлери
+    # === Всі твої хендлери (залишаються без змін) ===
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(callback))
 
-    # Конверсація для додавання проєкту
     conv = ConversationHandler(
         entry_points=[CommandHandler("addproject", start_add_project)],
         states={
@@ -696,25 +699,34 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add_project)],
     )
     app.add_handler(conv)
-
-    # Обробка помилок
     app.add_error_handler(error_handler)
 
-    # Автопарсинг кожні 3 години (10800 секунд), перший запуск через 60 секунд
+    # Автопарсинг кожні 3 години
     app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
 
-    logger.info("Бот запущено та готовий до роботи")
+    logger.info("Бот запущено на Background Worker (polling)")
 
-    # ✅ Граціозне завершення при перезапуску/деплої на Render
-    try:
-        app.run_polling(drop_pending_updates=True)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Отримано сигнал завершення — зупиняємо бота...")
-    finally:
-        # Коректно зупиняємо бота, щоб звільнити getUpdates
-        asyncio.run(app.stop())
-        asyncio.run(app.shutdown())
+    # === Ключова частина: graceful shutdown для Background Worker ===
+    async def stop_bot():
+        logger.info("Отримано сигнал завершення — зупиняємо бота граціозно...")
+        await app.stop()
+        await app.shutdown()
         logger.info("Бот успішно зупинено")
+
+    # Ловимо сигнали, які Render надсилає при деплої/рестарті
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(stop_bot()))
+
+    # Запускаємо polling
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,  # на всяк випадок
+        )
+    finally:
+        # Якщо щось пішло не так — все одно намагаємося зупинити
+        asyncio.run(stop_bot())
 
 
 if __name__ == "__main__":
