@@ -4,7 +4,7 @@ import logging
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,23 +17,28 @@ from telegram.ext import (
     filters,
 )
 
-from parser_core import run_project  # <-- твій незмінений parser_core.py
+from openpyxl import load_workbook
+
+from parser_core import run_project  # parser_core.py НЕ чіпаємо
 
 # =========================
 # НАЛАШТУВАННЯ
 # =========================
 TELEGRAM_BOT_TOKEN = "8146349890:AAGvkkJnglQfQak0yRxX3JMGZ3zzbKSU-Eo"
+
 PROJECTS_FILE = "projects.json"
 
-# Адмін чат: можна задати через ENV або командою /admin (бот запам'ятає)
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+# ✅ Твій chat_id (fallback). ENV має пріоритет.
+DEFAULT_ADMIN_CHAT_ID = 909587225
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", str(DEFAULT_ADMIN_CHAT_ID)))
+
 ADMIN_FILE = "admin_chat_id.txt"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================
-# СТАН ДОДАВАННЯ ПРОЄКТУ
+# Conversation: ДОДАВАННЯ ПРОЄКТУ
 # =========================
 (
     NAME, LOCATION, LANGUAGE, API_KEYS, TARGET_DOMAINS, KEYWORDS, OUTPUT_PREFIX, HISTORY_FILE
@@ -43,8 +48,10 @@ logger = logging.getLogger(__name__)
 # ADMIN CHAT ID
 # =========================
 def load_admin_chat_id() -> int:
+    # 1) ENV
     if ADMIN_CHAT_ID:
         return ADMIN_CHAT_ID
+    # 2) файл
     try:
         if os.path.exists(ADMIN_FILE):
             return int(Path(ADMIN_FILE).read_text(encoding="utf-8").strip())
@@ -68,7 +75,7 @@ async def send_error_to_admin(context: ContextTypes.DEFAULT_TYPE, error_text: st
     try:
         await context.bot.send_message(
             chat_id=admin_id,
-            text=f"🚨 ПОМИЛКА В БОТІ:\n{error_text}\nЧас: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            text=f"🚨 ПОМИЛКА:\n{error_text}\nЧас: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
     except Exception as e:
         logger.error("Не вдалося надіслати помилку адміну: %s", e)
@@ -105,10 +112,33 @@ def get_state(context: ContextTypes.DEFAULT_TYPE):
     return context.user_data["state"]
 
 # =========================
-# XLSX HELPERS (шукаємо файл, який створив парсер)
+# SAFE SEND HELPERS
+# =========================
+async def _safe_send_message(bot, chat_id: int, text: str) -> bool:
+    if not chat_id:
+        return False
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        return True
+    except Exception as e:
+        logger.error("send_message failed (chat_id=%s): %s", chat_id, e)
+        return False
+
+async def _safe_send_document(bot, chat_id: int, path: Path, caption: str) -> bool:
+    if not chat_id:
+        return False
+    try:
+        with path.open("rb") as f:
+            await bot.send_document(chat_id=chat_id, document=f, caption=caption)
+        return True
+    except Exception as e:
+        logger.error("send_document failed (chat_id=%s, file=%s): %s", chat_id, path, e)
+        return False
+
+# =========================
+# XLSX HELPERS
 # =========================
 def find_latest_xlsx(since_ts: float) -> Optional[Path]:
-    """Повертає останній .xlsx, створений/змінений після since_ts (epoch seconds)"""
     latest = None
     latest_mtime = 0.0
     for p in Path(".").rglob("*.xlsx"):
@@ -120,6 +150,161 @@ def find_latest_xlsx(since_ts: float) -> Optional[Path]:
         except Exception:
             continue
     return latest
+
+def find_previous_report(output_prefix: str, current_path: Path) -> Optional[Path]:
+    candidates = []
+    for p in Path(".").rglob(f"{output_prefix}_*.xlsx"):
+        try:
+            if p.resolve() == current_path.resolve():
+                continue
+            candidates.append(p)
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+def read_target_domain_stats(xlsx_path: Path) -> Dict[str, Dict[str, float]]:
+    """
+    Повертає:
+      domain -> {"kw": int, "score": float}
+    З листа 'Target Domains Stats'.
+    Колонки: Domain | ... | Score | Keywords
+    """
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    if "Target Domains Stats" not in wb.sheetnames:
+        return {}
+    ws = wb["Target Domains Stats"]
+
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    header = [str(c.value).strip() if c.value is not None else "" for c in header_cells]
+    idx = {name: i for i, name in enumerate(header)}
+
+    domain_i = idx.get("Domain")
+    kw_i = idx.get("Keywords")
+    score_i = idx.get("Score")
+    total_i = idx.get("Total")  # фолбек
+
+    if domain_i is None:
+        return {}
+
+    out: Dict[str, Dict[str, float]] = {}
+
+    for row in ws.iter_rows(min_row=2):
+        domain = row[domain_i].value
+        if not domain:
+            continue
+        domain = str(domain).strip().lower()
+
+        kw_count = 0
+        if kw_i is not None:
+            cell = row[kw_i].value
+            if cell:
+                kws = [k.strip() for k in str(cell).split(";") if k.strip()]
+                kw_count = len(set(kws))
+
+        if kw_count == 0 and total_i is not None:
+            try:
+                kw_count = int(row[total_i].value or 0)
+            except Exception:
+                kw_count = 0
+
+        score = 0.0
+        if score_i is not None:
+            try:
+                score = float(row[score_i].value or 0)
+            except Exception:
+                score = 0.0
+
+        out[domain] = {"kw": float(kw_count), "score": score}
+
+    return out
+
+def _badge(prev: float, now: float, severe_rule=True) -> str:
+    if prev == 0 and now > 0:
+        return "🟢"
+    if prev > 0 and now == 0:
+        return "🟥"
+    if now > prev:
+        return "🟢"
+    if now < prev:
+        if severe_rule and (now * 2 < prev):
+            return "🟥"
+        return "🔻"
+    return "⚪"
+
+def format_delta_report(prev_map: Dict[str, Dict[str, float]],
+                        cur_map: Dict[str, Dict[str, float]],
+                        top_n: int = 30) -> str:
+    """
+    Порівнюємо:
+      - kw: скільки ключів по домену
+      - score: Score
+    Показуємо топ змін за kw (по модулю), а також score дельту.
+    """
+    domains = sorted(set(prev_map.keys()) | set(cur_map.keys()))
+
+    rows: List[Tuple[float, str, float, float, float, float]] = []
+    # tuple: (abs_kw_delta, domain, prev_kw, now_kw, prev_score, now_score)
+
+    summary = {"kw_up": 0, "kw_down": 0, "kw_severe": 0, "kw_new": 0, "kw_lost": 0, "kw_same": 0}
+
+    for d in domains:
+        pkw = float(prev_map.get(d, {}).get("kw", 0))
+        nkw = float(cur_map.get(d, {}).get("kw", 0))
+        ps = float(prev_map.get(d, {}).get("score", 0))
+        ns = float(cur_map.get(d, {}).get("score", 0))
+
+        if pkw == 0 and nkw > 0:
+            summary["kw_new"] += 1
+        elif pkw > 0 and nkw == 0:
+            summary["kw_lost"] += 1
+            summary["kw_down"] += 1
+            summary["kw_severe"] += 1
+        elif nkw > pkw:
+            summary["kw_up"] += 1
+        elif nkw < pkw:
+            summary["kw_down"] += 1
+            if nkw * 2 < pkw:
+                summary["kw_severe"] += 1
+        else:
+            summary["kw_same"] += 1
+
+        if nkw != pkw or ns != ps:
+            rows.append((abs(nkw - pkw), d, pkw, nkw, ps, ns))
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    rows = rows[:top_n]
+
+    lines = []
+    lines.append(
+        f"📊 *Динаміка vs попередній парсинг*\n"
+        f"Keywords: 🟢 {summary['kw_up']} | 🔻 {summary['kw_down']} (🟥 {summary['kw_severe']}) | NEW {summary['kw_new']} | LOST {summary['kw_lost']}"
+    )
+    lines.append("")
+    lines.append("```")
+    lines.append("KW | Prev→Now | ΔKW | SCORE | Prev→Now | ΔS  | Domain")
+    lines.append("---+----------+-----+-------+----------+-----+------------------------------")
+
+    for _, d, pkw, nkw, ps, ns in rows:
+        kw_badge = _badge(pkw, nkw, severe_rule=True)
+        score_badge = _badge(ps, ns, severe_rule=True)
+
+        dkw = int(nkw - pkw)
+        ds = ns - ps
+
+        dom = d[:30]
+        lines.append(
+            f"{kw_badge}  {int(pkw):>3}→{int(nkw):<3} {dkw:+4}   "
+            f"{score_badge}   {ps:>5.0f}→{ns:<5.0f} {ds:+5.0f}  {dom}"
+        )
+
+    if not rows:
+        lines.append("Нема змін у порівнянні з попереднім парсингом.")
+    lines.append("```")
+
+    return "\n".join(lines)
 
 # =========================
 # КЛАВІАТУРИ
@@ -144,7 +329,6 @@ def kb_projects(st):
     return InlineKeyboardMarkup(buttons)
 
 def kb_pages():
-    # 1..10
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("1", callback_data="setpages:1"),
@@ -178,7 +362,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
         "Привіт! Це бот для парсингу SERP.\n"
         "— Ручний парсинг: виберіть проєкти + сторінки і натисніть ▶️\n"
-        "— Автопарсинг: кожні 3 години (топ-30)\n\n"
+        "— Автопарсинг: кожні 3 години (TOP-30)\n\n"
         "Оберіть опцію в меню:",
         reply_markup=kb_main(st)
     )
@@ -228,75 +412,72 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⏳ Старт ручного парсингу\n"
             f"Проєктів: {len(st['projects'])}\n"
-            f"Сторінок: {pages} (топ {top_n})\n",
+            f"Сторінок: {pages} (TOP {top_n})\n",
             reply_markup=kb_main(st)
         )
 
-        # запускаємо в фоні, щоб бот не завис
         async def runner():
             try:
                 for i, name in enumerate(st["projects"], start=1):
                     reload_projects()
                     project = PROJECTS_BY_NAME.get(name)
                     if not project:
-                        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено.")
+                        await _safe_send_message(context.bot, chat_id, f"⚠️ [{i}/{len(st['projects'])}] Проєкт «{name}» не знайдено.")
                         continue
 
-                    # ✅ ВАЖЛИВО:
-                    # Ми НЕ передаємо pages=... у run_project (бо core його не приймає),
-                    # а передаємо max_positions = pages*10 у конфіг.
                     project_cfg = dict(project)
-                    project_cfg["max_positions"] = top_n  # <-- саме це визначає PAGES у parser_core
-                    # output_prefix лишається як є, парсер сам додає timestamp
+                    project_cfg["max_positions"] = top_n  # ✅ ключова логіка сторінок
+                    output_prefix = project_cfg.get("output_prefix", "report")
 
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»\n"
-                            f"Гео: {project_cfg.get('location')} | TOP: {top_n} | Сторінок: {pages}\n"
-                            f"Ключів: {len(project_cfg.get('keywords', []))} | Домени: {len(project_cfg.get('target_domains', []))}"
-                        )
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id,
+                        f"▶️ [{i}/{len(st['projects'])}] Парсю «{name}»\n"
+                        f"Гео: {project_cfg.get('location')} | TOP: {top_n} | Сторінок: {pages}\n"
+                        f"Ключів: {len(project_cfg.get('keywords', []))} | Домени: {len(project_cfg.get('target_domains', []))}"
                     )
 
                     start_ts = datetime.now().timestamp()
                     started_msg = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # run_project повертає шлях до файлу (у твоєму core так і є)
                     try:
                         out_path = await run_project(project_cfg)
                     except Exception as e:
-                        await context.bot.send_message(chat_id=chat_id, text=f"🚨 Помилка в «{name}»: {e}")
+                        await _safe_send_message(context.bot, chat_id, f"🚨 Помилка в «{name}»: {e}")
                         await send_error_to_admin(context, f"Помилка в «{name}»: {e}")
                         continue
 
-                    # пробуємо знайти xlsx (або за шляхом, або по mtime)
                     xlsx_path = None
                     if isinstance(out_path, str) and out_path.strip():
                         p = Path(out_path)
                         if p.exists():
                             xlsx_path = p
-
                     if xlsx_path is None:
                         xlsx_path = find_latest_xlsx(start_ts)
 
                     if xlsx_path and xlsx_path.exists():
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"✅ «{name}» готово.\nПочаток: {started_msg}\nФайл: {xlsx_path.name}"
-                        )
-                        with xlsx_path.open("rb") as f:
-                            await context.bot.send_document(chat_id=chat_id, document=f, caption=xlsx_path.name)
+                        await _safe_send_message(context.bot, chat_id, f"✅ «{name}» готово.\nПочаток: {started_msg}\nФайл: {xlsx_path.name}")
+                        await _safe_send_document(context.bot, chat_id, xlsx_path, caption=xlsx_path.name)
+
+                        # ✅ ДИНАМІКА (keywords + score)
+                        prev_xlsx = find_previous_report(output_prefix, xlsx_path)
+                        if prev_xlsx and prev_xlsx.exists():
+                            prev_stats = read_target_domain_stats(prev_xlsx)
+                            cur_stats = read_target_domain_stats(xlsx_path)
+                            msg = format_delta_report(prev_stats, cur_stats, top_n=30)
+                            await _safe_send_message(context.bot, chat_id, msg)
+                        else:
+                            await _safe_send_message(context.bot, chat_id, "ℹ️ Це перший звіт для цього проєкту — порівнювати поки немає з чим.")
                     else:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"✅ «{name}» готово, але Excel файл не знайдено.\n"
-                                f"Початок: {started_msg}\n"
-                                f"Перевір робочу директорію Render та права запису."
-                            )
+                        await _safe_send_message(
+                            context.bot,
+                            chat_id,
+                            f"✅ «{name}» готово, але Excel файл не знайдено.\n"
+                            f"Початок: {started_msg}\n"
+                            "Перевір робочу директорію Render та права запису."
                         )
 
-                await context.bot.send_message(chat_id=chat_id, text="🏁 Ручний парсинг завершено.")
+                await _safe_send_message(context.bot, chat_id, "🏁 Ручний парсинг завершено.")
             except Exception as e:
                 logger.exception("runner crashed: %s", e)
                 await send_error_to_admin(context, f"runner crashed: {e}")
@@ -328,10 +509,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "ℹ️ Команди:\n"
             "/start — меню\n"
-            "/addproject — додати проєкт (покроково)\n"
+            "/addproject — додати проєкт\n"
             "/cancel — скасувати додавання\n"
             "/admin — встановити чат для алертів\n\n"
-            "⚠️ Якщо бачиш 409 Conflict у логах — у тебе запущено ДВА інстанси polling.",
+            "Після кожного парсингу бот шле Excel + динаміку (Keywords + Score).",
             reply_markup=kb_main(st)
         )
         return
@@ -423,60 +604,29 @@ async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 # =========================
-# AUTO PARSING (топ-30 кожні 3 години)
+# AUTO PARSING (кожні 3 години, TOP-30)
 # =========================
-
-# глобально десь зверху файлу serp_bot.py
 AUTO_LOCK = asyncio.Lock()
 
-async def _safe_send_message(bot, chat_id: int, text: str):
-    """Не дає job впасти через Chat not found / Forbidden і т.п."""
-    if not chat_id:
-        return False
-    try:
-        await bot.send_message(chat_id=chat_id, text=text)
-        return True
-    except Exception as e:
-        logger.error("AUTO: send_message failed (chat_id=%s): %s", chat_id, e)
-        return False
-
-async def _safe_send_document(bot, chat_id: int, path: Path, caption: str):
-    if not chat_id:
-        return False
-    try:
-        with path.open("rb") as f:
-            await bot.send_document(chat_id=chat_id, document=f, caption=caption)
-        return True
-    except Exception as e:
-        logger.error("AUTO: send_document failed (chat_id=%s, file=%s): %s", chat_id, path, e)
-        return False
-
-
 async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
-    # ✅ 1) видно в логах КОЖЕН запуск планувальника
     logger.info("AUTO fired at %s UTC", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
 
-    # ✅ 2) не даємо запускати 2 автопарсинги одночасно
     if AUTO_LOCK.locked():
-        logger.warning("AUTO skipped: previous run is still in progress")
+        logger.warning("AUTO skipped: previous run still in progress")
         return
 
     async with AUTO_LOCK:
         admin_id = load_admin_chat_id()
-
-        # ✅ 3) якщо нема адміна — не мовчимо, а пишемо в лог
         if not admin_id:
-            logger.warning("AUTO skipped: admin chat id is not set. Do /admin or set ADMIN_CHAT_ID env")
+            logger.warning("AUTO skipped: admin chat id is not set. Do /admin or set ADMIN_CHAT_ID env.")
             return
 
         try:
             reload_projects()
             if not PROJECTS:
-                logger.warning("AUTO skipped: no projects in projects.json")
                 await _safe_send_message(context.bot, admin_id, "⚠️ Автопарсинг: projects.json порожній — проєктів нема.")
                 return
 
-            # ✅ 4) стартове повідомлення (але без падіння, якщо чат не доступний)
             await _safe_send_message(
                 context.bot,
                 admin_id,
@@ -486,7 +636,8 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
             for i, project in enumerate(PROJECTS, start=1):
                 name = project.get("name", "Unnamed")
                 cfg = dict(project)
-                cfg["max_positions"] = 30  # авто завжди TOP-30
+                cfg["max_positions"] = 30
+                output_prefix = cfg.get("output_prefix", "report")
 
                 await _safe_send_message(
                     context.bot,
@@ -496,48 +647,38 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 start_ts = datetime.now().timestamp()
-
-                # ✅ 5) парсимо
                 out_path = await run_project(cfg)
 
-                # ✅ 6) шукаємо Excel: або по out_path, або по "останній xlsx після start_ts"
                 xlsx_path = None
                 if isinstance(out_path, str) and out_path.strip():
                     p = Path(out_path)
                     if p.exists():
                         xlsx_path = p
-
                 if xlsx_path is None:
                     xlsx_path = find_latest_xlsx(start_ts)
 
                 if xlsx_path and xlsx_path.exists():
-                    await _safe_send_message(
-                        context.bot,
-                        admin_id,
-                        f"✅ «{name}» готово. Файл: {xlsx_path.name}"
-                    )
-                    await _safe_send_document(
-                        context.bot,
-                        admin_id,
-                        xlsx_path,
-                        caption=f"AUTO {xlsx_path.name}"
-                    )
+                    await _safe_send_message(context.bot, admin_id, f"✅ «{name}» готово. Файл: {xlsx_path.name}")
+                    await _safe_send_document(context.bot, admin_id, xlsx_path, caption=f"AUTO {xlsx_path.name}")
+
+                    # ✅ ДИНАМІКА (keywords + score)
+                    prev_xlsx = find_previous_report(output_prefix, xlsx_path)
+                    if prev_xlsx and prev_xlsx.exists():
+                        prev_stats = read_target_domain_stats(prev_xlsx)
+                        cur_stats = read_target_domain_stats(xlsx_path)
+                        msg = format_delta_report(prev_stats, cur_stats, top_n=30)
+                        await _safe_send_message(context.bot, admin_id, msg)
+                    else:
+                        await _safe_send_message(context.bot, admin_id, "ℹ️ Це перший звіт для цього проєкту — порівнювати поки немає з чим.")
                 else:
-                    logger.error("AUTO: xlsx not found for project '%s' (out_path=%r)", name, out_path)
-                    await _safe_send_message(
-                        context.bot,
-                        admin_id,
-                        f"✅ «{name}» готово, але Excel файл не знайдено (перевір права запису/робочу папку)."
-                    )
+                    await _safe_send_message(context.bot, admin_id, f"✅ «{name}» готово, але Excel файл не знайдено.")
 
             await _safe_send_message(context.bot, admin_id, "🏁 Автопарсинг завершено.")
 
         except Exception as e:
             logger.exception("auto_parsing_task crashed: %s", e)
-            # не даємо впасти мовчки
             await _safe_send_message(context.bot, admin_id, f"🚨 Автопарсинг впав: {e}")
             await send_error_to_admin(context, f"auto_parsing_task crashed: {e}")
-
 
 # =========================
 # ERROR HANDLER
@@ -553,6 +694,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # MAIN
 # =========================
 def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Set it in Render Environment variables.")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -577,9 +721,8 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # ✅ Автопарсинг кожні 3 години (TOP-30)
-    # ВАЖЛИВО: job_queue має бути доступний (потрібен python-telegram-bot[job-queue])
-    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=15)
+    # ✅ автопарсинг кожні 3 години
+    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
 
     logger.info("Бот запущений.")
     app.run_polling(drop_pending_updates=True)
