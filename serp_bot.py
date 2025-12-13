@@ -30,13 +30,20 @@ PROJECTS_FILE = "projects.json"
 USERS_FILE = "users.txt"
 ADMIN_FILE = "admin_chat_id.txt"
 LAST_HISTORY_DIR = "last_history"
-LOCK_FILE = "/tmp/telegram_bot.lock"  # Для уникнення конфліктів на Render
+LOCK_FILE = "/tmp/telegram_bot.lock"  # Лок для Render Background Worker
 
 DEFAULT_ADMIN_CHAT_ID = 909587225
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", str(DEFAULT_ADMIN_CHAT_ID)))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# =========================
+# ERROR HANDLER (ДОДАНО!)
+# =========================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Непіймана помилка:", exc_info=context.error)
+    await send_error_to_admin(context, f"Непіймана помилка: {context.error}")
 
 # =========================
 # ADMIN & USERS
@@ -151,7 +158,7 @@ async def _safe_send_document(bot, chat_id: int, path: Path, caption: str) -> bo
         return False
 
 # =========================
-# XLSX HELPERS
+# XLSX HELPERS (тільки Keywords динаміка)
 # =========================
 def find_latest_xlsx(since_ts: float) -> Optional[Path]:
     latest = None
@@ -174,7 +181,6 @@ def find_previous_report(output_prefix: str, current_path: Path) -> Optional[Pat
     return candidates[0]
 
 def read_target_domain_stats(xlsx_path: Path) -> Dict[str, float]:
-    """Повертає тільки кількість ключів (kw) по домену"""
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     if "Target Domains Stats" not in wb.sheetnames:
         return {}
@@ -273,7 +279,6 @@ def add_history_sheet_if_needed(xlsx_path: Path, project_name: str):
             data_to_save[sheet_name] = data
         history_path.write_text(json.dumps(data_to_save, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Додаємо лист History тільки якщо є попередній парсинг
         prev_reports = list(Path(".").rglob(f"*_{project_name}_*.xlsx"))
         if len(prev_reports) > 1 or (history_path.exists() and history_path.stat().st_size > 10):
             if "History" in wb.sheetnames:
@@ -489,7 +494,7 @@ async def get_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_output_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_project"]["output_prefix"] = update.message.text.strip()
-    await update.message.reply_text("Крок 8: Ім'я файлу історії (будь-яке, напр. history_fr.json)")
+    await update.message.reply_text("Крок 8: Ім'я файлу історії (будь-яке)")
     return HISTORY_FILE
 
 async def get_history_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -578,13 +583,13 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
             await _safe_send_message(context.bot, uid, "🏁 Автопарсинг завершено.")
 
 # =========================
-# MAIN (з локом для Background Worker)
+# MAIN (з локом)
 # =========================
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не заданий!")
 
-    # Перевірка на паралельний запуск
+    # Захист від кількох інстанцій
     try:
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -614,6 +619,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add_project)],
     )
     app.add_handler(conv)
+
+    # ДОДАНО error_handler!
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
