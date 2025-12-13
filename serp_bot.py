@@ -596,19 +596,25 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
 # MAIN (з локом)
 # =========================
 def main():
+    # Якщо змінна BOT_ENABLED не встановлена або не "1" — просто виходимо (для безпеки при деплої)
+    if os.getenv("BOT_ENABLED") != "1":
+        logger.info("BOT_ENABLED не встановлено або не '1' — бот не запускається (ймовірно деплой).")
+        return  # Тихо виходимо — ніякого polling, ніяких конфліктів
+
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не заданий!")
 
-    # Захист від кількох інстанцій
+    # Захист від кількох інстанцій (додатково до BOT_ENABLED)
     try:
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, IOError):
-        logger.error("Інша інстанція бота вже працює. Зупиняємо цю.")
+        logger.error("Інша інстанція вже працює — виходимо.")
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Всі хендлери (без змін)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("users", cmd_users))
@@ -629,16 +635,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add_project)],
     )
     app.add_handler(conv)
-
-    # ДОДАНО error_handler!
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
 
-    logger.info("Бот запущено (єдиний екземпляр)")
+    logger.info("Бот запущено і працює (polling активний)")
 
     async def stop_bot():
-        logger.info("Зупиняємо бота...")
+        logger.info("Зупиняємо бота граціозно...")
         await app.stop()
         await app.shutdown()
         os.close(lock_fd)
