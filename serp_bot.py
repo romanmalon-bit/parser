@@ -229,6 +229,7 @@ def format_delta_report(prev_map: Dict[str, float], cur_map: Dict[str, float], t
     domains = sorted(set(prev_map.keys()) | set(cur_map.keys()))
     rows: List[Tuple[float, str, float, float]] = []
     summary = {"kw_up": 0, "kw_down": 0, "kw_severe": 0, "kw_new": 0, "kw_lost": 0}
+
     for d in domains:
         pkw = prev_map.get(d, 0.0)
         nkw = cur_map.get(d, 0.0)
@@ -246,24 +247,33 @@ def format_delta_report(prev_map: Dict[str, float], cur_map: Dict[str, float], t
                 summary["kw_severe"] += 1
         if nkw != pkw:
             rows.append((abs(nkw - pkw), d, pkw, nkw))
+
     rows.sort(key=lambda x: x[0], reverse=True)
     rows = rows[:top_n]
+
     lines = []
     lines.append(
         f"📊 *Динаміка Keywords vs попередній парсинг*\n"
-        f"🟢 {summary['kw_up']} | 🔻 {summary['kw_down']} (🟥 {summary['kw_severe']}) | NEW {summary['kw_new']} | LOST {summary['kw_lost']}"
+        f"🟢 Зростання: {summary['kw_up']}  🔻 Падіння: {summary['kw_down']} (🟥 сильне: {summary['kw_severe']})\n"
+        f"NEW: {summary['kw_new']}  LOST: {summary['kw_lost']}\n"
     )
-    lines.append("")
-    lines.append("```")
-    lines.append("KW | Prev→Now | ΔKW | Domain")
-    lines.append("---+----------+-----+--------------------------------")
+    lines.append("```text")
+
+    # Заголовок з чітким вирівнюванням
+    lines.append(f"{'Бадж':<2} {'Prev → Now':^11} {'ΔKW':>6} {'Domain'}")
+    lines.append("───┼─────────────┼──────┼───────────────────────────────────")
+
     for _, d, pkw, nkw in rows:
         badge = _badge(pkw, nkw)
         dkw = int(nkw - pkw)
-        dom = d[:34]
-        lines.append(f"{badge} {int(pkw):>3}→{int(nkw):<3} {dkw:+4} {dom}")
+        delta_str = f"{dkw:+}".rjust(5)
+        prev_now = f"{int(pkw):>4} → {int(nkw):<4}"
+        domain = d[:35]  # обрізаємо довгі домени
+        lines.append(f"{badge:<2} {prev_now} {delta_str} {domain}")
+
     if not rows:
-        lines.append("Нема змін у кількості ключів.")
+        lines.append("  Немає змін у кількості ключових слів.")
+
     lines.append("```")
     return "\n".join(lines)
 
