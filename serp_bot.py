@@ -425,50 +425,119 @@ async def cancel_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # =========================
 # AUTO PARSING (топ-30 кожні 3 години)
 # =========================
+
+# глобально десь зверху файлу serp_bot.py
+AUTO_LOCK = asyncio.Lock()
+
+async def _safe_send_message(bot, chat_id: int, text: str):
+    """Не дає job впасти через Chat not found / Forbidden і т.п."""
+    if not chat_id:
+        return False
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except Exception as e:
+        logger.error("AUTO: send_message failed (chat_id=%s): %s", chat_id, e)
+        return False
+
+async def _safe_send_document(bot, chat_id: int, path: Path, caption: str):
+    if not chat_id:
+        return False
+    try:
+        with path.open("rb") as f:
+            await bot.send_document(chat_id=chat_id, document=f, caption=caption)
+        return True
+    except Exception as e:
+        logger.error("AUTO: send_document failed (chat_id=%s, file=%s): %s", chat_id, path, e)
+        return False
+
+
 async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
-    admin_id = load_admin_chat_id()
-    if not admin_id:
+    # ✅ 1) видно в логах КОЖЕН запуск планувальника
+    logger.info("AUTO fired at %s UTC", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # ✅ 2) не даємо запускати 2 автопарсинги одночасно
+    if AUTO_LOCK.locked():
+        logger.warning("AUTO skipped: previous run is still in progress")
         return
 
-    try:
-        reload_projects()
-        if not PROJECTS:
+    async with AUTO_LOCK:
+        admin_id = load_admin_chat_id()
+
+        # ✅ 3) якщо нема адміна — не мовчимо, а пишемо в лог
+        if not admin_id:
+            logger.warning("AUTO skipped: admin chat id is not set. Do /admin or set ADMIN_CHAT_ID env")
             return
 
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (TOP-30)"
-        )
+        try:
+            reload_projects()
+            if not PROJECTS:
+                logger.warning("AUTO skipped: no projects in projects.json")
+                await _safe_send_message(context.bot, admin_id, "⚠️ Автопарсинг: projects.json порожній — проєктів нема.")
+                return
 
-        for i, project in enumerate(PROJECTS, start=1):
-            name = project.get("name", "Unnamed")
-            cfg = dict(project)
-            cfg["max_positions"] = 30  # авто завжди топ-30
+            # ✅ 4) стартове повідомлення (але без падіння, якщо чат не доступний)
+            await _safe_send_message(
+                context.bot,
+                admin_id,
+                f"🤖 Автопарсинг стартував. Проєктів: {len(PROJECTS)} (TOP-30)."
+            )
 
-            await context.bot.send_message(chat_id=admin_id, text=f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»…")
-            start_ts = datetime.now().timestamp()
-            out_path = await run_project(cfg)
+            for i, project in enumerate(PROJECTS, start=1):
+                name = project.get("name", "Unnamed")
+                cfg = dict(project)
+                cfg["max_positions"] = 30  # авто завжди TOP-30
 
-            xlsx_path = None
-            if isinstance(out_path, str) and out_path.strip():
-                p = Path(out_path)
-                if p.exists():
-                    xlsx_path = p
-            if xlsx_path is None:
-                xlsx_path = find_latest_xlsx(start_ts)
+                await _safe_send_message(
+                    context.bot,
+                    admin_id,
+                    f"▶️ [{i}/{len(PROJECTS)}] Парсю «{name}»… "
+                    f"Ключів: {len(cfg.get('keywords', []))} | Доменів: {len(cfg.get('target_domains', []))}"
+                )
 
-            if xlsx_path and xlsx_path.exists():
-                await context.bot.send_message(chat_id=admin_id, text=f"✅ «{name}» готово. Файл: {xlsx_path.name}")
-                with xlsx_path.open("rb") as f:
-                    await context.bot.send_document(chat_id=admin_id, document=f, caption=f"AUTO {xlsx_path.name}")
-            else:
-                await context.bot.send_message(chat_id=admin_id, text=f"✅ «{name}» готово, але Excel файл не знайдено.")
+                start_ts = datetime.now().timestamp()
 
-        await context.bot.send_message(chat_id=admin_id, text="🏁 Автопарсинг завершено.")
+                # ✅ 5) парсимо
+                out_path = await run_project(cfg)
 
-    except Exception as e:
-        logger.exception("auto_parsing_task crashed: %s", e)
-        await send_error_to_admin(context, f"auto_parsing_task crashed: {e}")
+                # ✅ 6) шукаємо Excel: або по out_path, або по "останній xlsx після start_ts"
+                xlsx_path = None
+                if isinstance(out_path, str) and out_path.strip():
+                    p = Path(out_path)
+                    if p.exists():
+                        xlsx_path = p
+
+                if xlsx_path is None:
+                    xlsx_path = find_latest_xlsx(start_ts)
+
+                if xlsx_path and xlsx_path.exists():
+                    await _safe_send_message(
+                        context.bot,
+                        admin_id,
+                        f"✅ «{name}» готово. Файл: {xlsx_path.name}"
+                    )
+                    await _safe_send_document(
+                        context.bot,
+                        admin_id,
+                        xlsx_path,
+                        caption=f"AUTO {xlsx_path.name}"
+                    )
+                else:
+                    logger.error("AUTO: xlsx not found for project '%s' (out_path=%r)", name, out_path)
+                    await _safe_send_message(
+                        context.bot,
+                        admin_id,
+                        f"✅ «{name}» готово, але Excel файл не знайдено (перевір права запису/робочу папку)."
+                    )
+
+            await _safe_send_message(context.bot, admin_id, "🏁 Автопарсинг завершено.")
+
+        except Exception as e:
+            logger.exception("auto_parsing_task crashed: %s", e)
+            # не даємо впасти мовчки
+            await _safe_send_message(context.bot, admin_id, f"🚨 Автопарсинг впав: {e}")
+            await send_error_to_admin(context, f"auto_parsing_task crashed: {e}")
+
 
 # =========================
 # ERROR HANDLER
