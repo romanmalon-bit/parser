@@ -344,8 +344,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     await update.effective_message.reply_text(
         "Привіт! Це бот для парсингу SERP.\n"
-        "— Ручний парсинг: виберіть проєкти + сторінки → ▶️\n"
-        "— Автопарсинг: кожні 3 години (TOP-30), звіти всім користувачам\n\n"
         "Оберіть дію:",
         reply_markup=kb_main(st)
     )
