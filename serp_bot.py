@@ -5,7 +5,7 @@ import os
 import signal
 import fcntl
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time
 from typing import List, Optional, Dict, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,7 +30,7 @@ PROJECTS_FILE = "projects.json"
 USERS_FILE = "users.txt"
 ADMIN_FILE = "admin_chat_id.txt"
 LAST_HISTORY_DIR = "last_history"
-LOCK_FILE = "/tmp/telegram_bot.lock"  # Лок для Render Background Worker
+LOCK_FILE = "/tmp/telegram_bot.lock"
 
 DEFAULT_ADMIN_CHAT_ID = 909587225
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", str(DEFAULT_ADMIN_CHAT_ID)))
@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================
-# ERROR HANDLER (ДОДАНО!)
+# ERROR HANDLER
 # =========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Непіймана помилка:", exc_info=context.error)
@@ -158,7 +158,7 @@ async def _safe_send_document(bot, chat_id: int, path: Path, caption: str) -> bo
         return False
 
 # =========================
-# XLSX HELPERS (тільки Keywords динаміка)
+# XLSX HELPERS
 # =========================
 def find_latest_xlsx(since_ts: float) -> Optional[Path]:
     latest = None
@@ -227,14 +227,17 @@ def _badge(prev: float, now: float) -> str:
 
 def format_delta_report(prev_map: Dict[str, float], cur_map: Dict[str, float], top_n: int = 30) -> str:
     domains = sorted(set(prev_map.keys()) | set(cur_map.keys()))
-    rows: List[Tuple[float, str, float, float]] = []
-    summary = {"kw_up": 0, "kw_down": 0, "kw_severe": 0, "kw_new": 0, "kw_lost": 0}
+    
+    rows: List[Tuple[float, float, str, float, float]] = []
+    summary = {"kw_up": 0, "kw_down": 0, "kw_severe": 0, "kw_new": 0, "kw_lost": 0, "kw_same": 0}
 
     for d in domains:
         pkw = prev_map.get(d, 0.0)
         nkw = cur_map.get(d, 0.0)
+        
         if pkw == 0 and nkw > 0:
             summary["kw_new"] += 1
+            summary["kw_up"] += 1
         elif pkw > 0 and nkw == 0:
             summary["kw_lost"] += 1
             summary["kw_down"] += 1
@@ -245,35 +248,34 @@ def format_delta_report(prev_map: Dict[str, float], cur_map: Dict[str, float], t
             summary["kw_down"] += 1
             if nkw * 2 < pkw:
                 summary["kw_severe"] += 1
-        if nkw != pkw:
-            rows.append((abs(nkw - pkw), d, pkw, nkw))
+        else:
+            summary["kw_same"] += 1
+        
+        rows.append((abs(nkw - pkw), nkw, d, pkw, nkw))
 
-    rows.sort(key=lambda x: x[0], reverse=True)
+    rows.sort(key=lambda x: (-x[0], -x[1]))
     rows = rows[:top_n]
 
     lines = []
     lines.append(
-        f"📊 *Динаміка Keywords vs попередній парсинг*\n"
+        f"📊 *Динаміка Keywords vs попередній парсинг* (топ {len(rows)} доменів)\n"
         f"🟢 Зростання: {summary['kw_up']}  🔻 Падіння: {summary['kw_down']} (🟥 сильне: {summary['kw_severe']})\n"
-        f"NEW: {summary['kw_new']}  LOST: {summary['kw_lost']}\n"
+        f"NEW: {summary['kw_new']}  LOST: {summary['kw_lost']}  ⚪ Без змін: {summary['kw_same']}\n"
     )
     lines.append("```text")
-
-    # Заголовок з чітким вирівнюванням
     lines.append(f"{'Бадж':<2} {'Prev → Now':^11} {'ΔKW':>6} {'Domain'}")
     lines.append("───┼─────────────┼──────┼───────────────────────────────────")
 
-    for _, d, pkw, nkw in rows:
+    for _, _, d, pkw, nkw in rows:
         badge = _badge(pkw, nkw)
         dkw = int(nkw - pkw)
         delta_str = f"{dkw:+}".rjust(5)
         prev_now = f"{int(pkw):>4} → {int(nkw):<4}"
-        domain = d[:35]  # обрізаємо довгі домени
+        domain = d[:35]
         lines.append(f"{badge:<2} {prev_now} {delta_str} {domain}")
 
     if not rows:
-        lines.append("  Немає змін у кількості ключових слів.")
-
+        lines.append("  Немає даних для порівняння.")
     lines.append("```")
     return "\n".join(lines)
 
@@ -304,6 +306,21 @@ def add_history_sheet_if_needed(xlsx_path: Path, project_name: str):
         wb.save(xlsx_path)
     except Exception as e:
         logger.error(f"Помилка додавання історії для {project_name}: {e}")
+
+def cleanup_old_reports(output_prefix: str, keep_last: int = 2):
+    try:
+        files = list(Path(".").rglob(f"{output_prefix}_*.xlsx"))
+        if len(files) <= keep_last:
+            return
+        files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        for old_file in files[keep_last:]:
+            try:
+                old_file.unlink()
+                logger.info(f"Видалено старий файл: {old_file.name}")
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити {old_file.name}: {e}")
+    except Exception as e:
+        logger.error(f"Помилка при очищенні файлів: {e}")
 
 # =========================
 # КЛАВІАТУРИ
@@ -344,6 +361,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(context)
     await update.effective_message.reply_text(
         "Привіт! Це бот для парсингу SERP.\n"
+        "— Ручний парсинг: виберіть проєкти + сторінки → ▶️\n"
+        "— Автопарсинг: о 07:00, 12:00, 17:00 за Києвом\n\n"
         "Оберіть дію:",
         reply_markup=kb_main(st)
     )
@@ -410,6 +429,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     if xlsx_path and xlsx_path.exists():
                         add_history_sheet_if_needed(xlsx_path, name)
+                        cleanup_old_reports(output_prefix)  # Залишаємо тільки 2 файли
                         await _safe_send_message(context.bot, chat_id, f"✅ «{name}» готово")
                         await _safe_send_document(context.bot, chat_id, xlsx_path, caption=xlsx_path.name)
 
@@ -571,6 +591,7 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
 
             if xlsx_path and xlsx_path.exists():
                 add_history_sheet_if_needed(xlsx_path, name)
+                cleanup_old_reports(output_prefix)  # Залишаємо тільки 2 файли
                 for uid in users:
                     await _safe_send_message(context.bot, uid, f"✅ «{name}» готово")
                     await _safe_send_document(context.bot, uid, xlsx_path, caption=f"AUTO {xlsx_path.name}")
@@ -591,28 +612,21 @@ async def auto_parsing_task(context: ContextTypes.DEFAULT_TYPE):
             await _safe_send_message(context.bot, uid, "🏁 Автопарсинг завершено.")
 
 # =========================
-# MAIN (з локом)
+# MAIN
 # =========================
 def main():
-    # Якщо змінна BOT_ENABLED не встановлена або не "1" — просто виходимо (для безпеки при деплої)
-    if os.getenv("BOT_ENABLED") != "1":
-        logger.info("BOT_ENABLED не встановлено або не '1' — бот не запускається (ймовірно деплой).")
-        return  # Тихо виходимо — ніякого polling, ніяких конфліктів
-
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не заданий!")
 
-    # Захист від кількох інстанцій (додатково до BOT_ENABLED)
     try:
         lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, IOError):
-        logger.error("Інша інстанція вже працює — виходимо.")
+        logger.error("Інша інстанція бота вже працює. Зупиняємо цю.")
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Всі хендлери (без змін)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("users", cmd_users))
@@ -635,18 +649,16 @@ def main():
     app.add_handler(conv)
     app.add_error_handler(error_handler)
 
-    # Автопарсинг за розкладом для Києва взимку (UTC+2 → віднімаємо 2 години)
-    from datetime import time
+    # Автопарсинг о 07:00, 12:00, 17:00 за Києвом (взимку, UTC+2)
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))
 
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))   # 07:00 Київ
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))  # 12:00 Київ
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))  # 17:00 Київ
-
-    logger.info("Автопарсинг заплановано на 07:00, 12:00 та 17:00 за київським часом (взимку)")
+    logger.info("Автопарсинг заплановано на 07:00, 12:00, 17:00 за київським часом")
     logger.info("Бот запущено і працює (polling активний)")
 
     async def stop_bot():
-        logger.info("Зупиняємо бота граціозно...")
+        logger.info("Зупиняємо бота...")
         await app.stop()
         await app.shutdown()
         os.close(lock_fd)
