@@ -637,11 +637,14 @@ def main():
     app.add_handler(conv)
     app.add_error_handler(error_handler)
 
-    # Для Києва взимку (UTC+2)
-app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))   # 07:00 Київ = 05:00 UTC
-app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))  # 12:00 Київ = 10:00 UTC
-app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))  # 17:00 Київ = 15:00 UTC
+    # Автопарсинг за розкладом для Києва взимку (UTC+2 → віднімаємо 2 години)
+    from datetime import time
 
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))   # 07:00 Київ
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))  # 12:00 Київ
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))  # 17:00 Київ
+
+    logger.info("Автопарсинг заплановано на 07:00, 12:00 та 17:00 за київським часом (взимку)")
     logger.info("Бот запущено і працює (polling активний)")
 
     async def stop_bot():
