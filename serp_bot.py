@@ -637,7 +637,10 @@ def main():
     app.add_handler(conv)
     app.add_error_handler(error_handler)
 
-    app.job_queue.run_repeating(auto_parsing_task, interval=10800, first=60)
+    # Для Києва взимку (UTC+2)
+app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))   # 07:00 Київ = 05:00 UTC
+app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))  # 12:00 Київ = 10:00 UTC
+app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))  # 17:00 Київ = 15:00 UTC
 
     logger.info("Бот запущено і працює (polling активний)")
 
