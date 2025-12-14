@@ -618,14 +618,22 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не заданий!")
 
+    # Спроба захопити файл-лок
     try:
-        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("Лок захоплено — це єдина інстанція бота")
     except (OSError, IOError):
-        logger.error("Інша інстанція бота вже працює. Зупиняємо цю.")
-        return
+        logger.warning("Виявлено іншу інстанцію бота. Чекаємо, поки вона завершиться...")
+        # Нова копія просто спить вічно — стара отримає SIGTERM і звільнить лок
+        import time
+        while True:
+            time.sleep(3600)  # спимо годину за раз, не споживаючи CPU
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # === ТУТ УСЕ ТВОЄ НАЛАШТУВАННЯ ХЕНДЛЕРІВ ТА JOB_QUEUE ===
+    # (залиш без змін — add_handler, ConversationHandler, run_daily тощо)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", cmd_admin))
@@ -649,16 +657,16 @@ def main():
     app.add_handler(conv)
     app.add_error_handler(error_handler)
 
-    # Автопарсинг о 07:00, 12:00, 17:00 за Києвом (взимку, UTC+2)
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))
-    app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))
+    # Автопарсинг за розкладом (Київ взимку)
+    from datetime import time
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=5, minute=0))   # 07:00 Київ
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=10, minute=0))  # 12:00 Київ
+    app.job_queue.run_daily(auto_parsing_task, time=time(hour=15, minute=0))  # 17:00 Київ
 
-    logger.info("Автопарсинг заплановано на 07:00, 12:00, 17:00 за київським часом")
-    logger.info("Бот запущено і працює (polling активний)")
+    logger.info("Бот повністю запущено (polling активний)")
 
     async def stop_bot():
-        logger.info("Зупиняємо бота...")
+        logger.info("Граціозне завершення бота...")
         await app.stop()
         await app.shutdown()
         os.close(lock_fd)
@@ -666,7 +674,7 @@ def main():
             os.unlink(LOCK_FILE)
         except OSError:
             pass
-        logger.info("Бот зупинено")
+        logger.info("Лок звільнено, бот зупинено")
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
